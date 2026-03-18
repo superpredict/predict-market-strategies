@@ -1,0 +1,40 @@
+{
+  "name": "predict-market-strategies",
+  "version": "1.0.0",
+  "description": "Polymarket taker bot — fair-value-based strategy with multi-process Redis architecture",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup",
+    "start": "node dist/index.js",
+    "takerbot": "tsx takerbot/takerbot.ts",
+    "takerbot:btcFeeder": "tsx takerbot/feeders/btcPriceFeeder.ts",
+    "takerbot:marketFeeder": "tsx takerbot/feeders/marketPriceFeeder.ts",
+    "takerbot:fvUpdater": "tsx takerbot/updater/fairValueUpdater.ts",
+    "takerbot:portfolio": "tsx takerbot/portfolio/portfolioTracker.ts",
+    "takerbot:pm2": "pm2 start takerbot/ecosystem.config.cjs",
+    "takerbot:pm2:prod": "pm2 start takerbot/ecosystem.config.cjs --env production",
+    "start:pm2": "pm2 start takerbot/ecosystem.config.cjs",
+    "stop:pm2": "pm2 stop takerbot/ecosystem.config.cjs",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@superpredict/ccxt": "^0.1.0",
+    "dotenv": "^16.4.7",
+    "ioredis": "^5.4.2",
+    "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/ws": "^8.5.14",
+    "tsup": "^8.4.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  },
+  "author": "",
+  "license": "ISC"
+}
