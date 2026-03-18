@@ -1,0 +1,1 @@
+# predict-market-strategies
