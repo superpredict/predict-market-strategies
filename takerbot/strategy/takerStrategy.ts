@@ -131,20 +131,20 @@ export class TakerStrategy extends Strategy {
   }
 
   // ─── Checks ───────────────────────────────────────────────────────────────────
-
   private shouldTrade(fv: FairValue): boolean {
     const { timeToExpiryMs, confidence } = fv;
-
+  
     if (timeToExpiryMs <= STOP_TRADING_BEFORE_EXPIRY_MS) {
       console.log(`[takerStrategy] too close to expiry (${Math.round(timeToExpiryMs / 1000)}s), halting`);
       return false;
     }
-
+  
     if (confidence < MIN_CONFIDENCE) {
-      console.log(`[takerStrategy] low confidence (${(confidence * 100).toFixed(0)}%), skipping`);
+      console.log(`[takerStrategy] low confidence (${(confidence * 100).toFixed(1)}%) — skipping`);
       return false;
     }
-
+  
+    console.log(`[takerStrategy] ✅ OK to trade | conf=${(confidence * 100).toFixed(1)}% | tte=${Math.round(timeToExpiryMs / 1000)}s`);
     return true;
   }
 

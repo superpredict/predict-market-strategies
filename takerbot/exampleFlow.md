@@ -12,8 +12,9 @@ System parameters:
 - EDGE_THRESHOLD     = 0.03 (3%)
 - POSITION_SIZE_USDC = 50
 - FV_SCALE           = 5
-- MIN_CONFIDENCE     = 0.4
-- STOP_TRADING_BEFORE_EXPIRY_MS = 90,000 ms
+- MOMENTUM_SCALE     = 30
+- MIN_CONFIDENCE     = 0.22
+- STOP_TRADING_BEFORE_EXPIRY_MS = 60,000 ms
 
 ## Step 1 – btcPriceFeeder receives Binance bookTicker update
 Time: t=0s  
@@ -46,7 +47,7 @@ relativeDistance = (96800.85 - 97000) / 97000 ≈ -0.01257
 FV = clamp(0.5 + (-0.01257) × 5, 0.05, 0.95) ≈ 0.437
 ```
 
-confidence ≈ 0.56 (data freshness + time remaining)
+confidence ≈ 0.56 (data freshness + time remaining; floor = 0.15)
 
 Actions:
 - SET fv:0xabc123... → value=0.437, confidence=0.56, ...
@@ -123,15 +124,18 @@ Terminal output:
 
 ## Common Startup Commands
 
-```sh
-# Debug mode (recommended for testing)
-tsx takerbot/feeders/btcPriceFeeder.ts
-tsx takerbot/feeders/marketPriceFeeder.ts --marketid=0xabc... --tokenid=12345...
-tsx takerbot/updater/fairValueUpdater.ts --marketid=0xabc... --strike=97000
-tsx takerbot/takerbot.ts --marketid=0xabc...
-tsx takerbot/portfolio/portfolioTracker.ts
+Market identity is discovered automatically via `marketDiscovery` — no per-process CLI arguments are needed.
 
-# Start everything with PM2 (using ecosystem.config.cjs)
+```sh
+# Debug mode (recommended for testing) — open 6 terminals:
+node --import tsx/esm takerbot/feeders/btcPriceFeeder.ts
+node --import tsx/esm takerbot/feeders/marketDiscovery.ts
+node --import tsx/esm takerbot/feeders/marketPriceFeeder.ts
+node --import tsx/esm takerbot/updater/fairValueUpdater.ts
+node --import tsx/esm takerbot/portfolio/portfolioTracker.ts
+node --import tsx/esm takerbot/takerbot.ts
+
+# Start everything with PM2 (recommended)
 pm2 start takerbot/ecosystem.config.cjs
 
 # Production mode (disable dry run)

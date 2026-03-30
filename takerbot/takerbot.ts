@@ -1,44 +1,124 @@
 /**
  * takerbot — entry point
  *
- * Bootstraps the TakerStrategy for a single Polymarket BTC 15-min market.
+ * Bootstraps the TakerStrategy for BTC 15-min markets. Market identity is
+ * discovered automatically via the marketDiscovery process — no CLI args needed.
  *
- * Usage:
- *   # Auto-discover the current active BTC 15-min market:
- *   node --import tsx/esm takerbot/takerbot.ts
+ * On startup:
+ *   1. Reads the current active market from Redis key  market:active-btc15m.
+ *   2. Starts TakerStrategy for that market.
+ *   3. Subscribes to  market:new-active-market  for live rotation events.
  *
- *   # Trade a specific market by condition ID:
- *   node --import tsx/esm takerbot/takerbot.ts --marketid=0xabc...
+ * On each rotation event (every 15 min):
+ *   4. Stops the old strategy (closes Redis, unsubscribes WS).
+ *   5. Starts a fresh strategy for the new market.
+ *   6. Re-subscribes to  market:new-active-market  on the new subscriber client.
  *
  * Environment variables (see deploy/.env.example):
  *   PRIVATE_KEY   Ethereum wallet private key (required when DRY_RUN=false)
- *   DRY_RUN       true | false (default: true — always dry-run unless explicitly set)
- *
- * All strategy tuning parameters (position size, edge threshold, exposure cap,
- * confidence threshold, etc.) are static constants in config/constants.ts.
+ *   DRY_RUN       true | false (default: true)
  */
 
 import dotenv from 'dotenv';
 import { Polymarket } from '@superpredict/ccxt';
-import { buildMarketConfig, findActiveBtc15MinMarket } from './config/markets.js';
-import { VERBOSE } from './config/constants.js';
+import { buildMarketConfigFromInfo } from './config/markets.js';
+import { STOP_TRADING_BEFORE_EXPIRY_MS, VERBOSE } from './config/constants.js';
+import { getRedisClient, getSubscriberClient } from './shared/redis.js';
+import { getActiveMarket } from './shared/state.js';
+import { REDIS_CHANNELS, type ActiveMarketInfo } from './shared/types.js';
 import { TakerStrategy } from './strategy/takerStrategy.js';
 
 dotenv.config();
 
-// ─── CLI args ─────────────────────────────────────────────────────────────────
+// ─── State ────────────────────────────────────────────────────────────────────
 
-function getArg(name: string): string | undefined {
-  const flag = `--${name}=`;
-  const arg = process.argv.find((a) => a.startsWith(flag));
-  return arg?.slice(flag.length);
+let exchange: Polymarket;
+let currentStrategy: TakerStrategy | null = null;
+let stopBeforeExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ─── Market rotation ──────────────────────────────────────────────────────────
+
+async function rotateToMarket(info: ActiveMarketInfo): Promise<void> {
+  console.log(
+    `[takerbot] rotating to market ${info.conditionId.slice(0, 10)}… "${info.question}"`
+  );
+
+  // Cancel any pending pre-expiry stop timer from the previous market
+  if (stopBeforeExpiryTimer) {
+    clearTimeout(stopBeforeExpiryTimer);
+    stopBeforeExpiryTimer = null;
+  }
+
+  // Stop old strategy. TakerStrategy.stop() closes the Redis connections so
+  // getSubscriberClient() / getRedisClient() will lazily re-create them below.
+  if (currentStrategy) {
+    await currentStrategy.stop();
+    currentStrategy = null;
+  }
+
+  const config = buildMarketConfigFromInfo(info);
+
+  console.log(`[takerbot] market   : ${config.marketId}`);
+  console.log(`[takerbot] expiry   : ${config.expiryTime.toISOString()}`);
+  console.log(`[takerbot] strike   : ${config.strikePrice ?? 'N/A (up/down momentum)'}`);
+  console.log(`[takerbot] dryRun   : ${config.dryRun}`);
+  console.log(`[takerbot] size     : $${config.positionSizeUsdc} USDC per trade`);
+  console.log(`[takerbot] edge     : ${(config.edgeThreshold * 100).toFixed(1)}% required`);
+
+  currentStrategy = new TakerStrategy(exchange, config);
+
+  currentStrategy.on('error', (err: Error) => {
+    console.error('[takerbot] strategy error:', err);
+  });
+
+  currentStrategy.on('order', (order: { id: string; side: string; price: number }) => {
+    console.log(`[takerbot] order: id=${order.id} side=${order.side} price=${order.price}`);
+  });
+
+  await currentStrategy.start();
+
+  // Re-subscribe to market:new-active-market on the fresh subscriber client
+  await subscribeToMarketDiscovery();
+
+  // Stop trading STOP_TRADING_BEFORE_EXPIRY_MS before expiry (but don't exit;
+  // the next rotation event will start a new strategy for the next window).
+  const msUntilStop = Math.max(0, info.expiryTs - Date.now() - STOP_TRADING_BEFORE_EXPIRY_MS);
+  stopBeforeExpiryTimer = setTimeout(() => {
+    console.log('[takerbot] market near expiry — stopping strategy; awaiting next market…');
+    void currentStrategy?.stop().then(() => {
+      currentStrategy = null;
+    });
+  }, msUntilStop);
+
+  console.log(
+    `[takerbot] strategy running — will stop ${Math.round(msUntilStop / 1000)}s from now`
+  );
 }
 
-const EXPLICIT_MARKET_ID = getArg('marketid') ?? process.env['MARKET_ID'];
+// ─── Market discovery subscription ───────────────────────────────────────────
+
+async function subscribeToMarketDiscovery(): Promise<void> {
+  const sub = getSubscriberClient(); // lazily created / re-created after rotation
+
+  await sub.subscribe(REDIS_CHANNELS.newActiveMarket);
+
+  // Replace any existing listener to avoid duplicate handlers after rotation
+  sub.removeAllListeners('message');
+
+  sub.on('message', (channel: string, message: string) => {
+    if (channel !== REDIS_CHANNELS.newActiveMarket) return;
+    void (async () => {
+      try {
+        const info = JSON.parse(message) as ActiveMarketInfo;
+        await rotateToMarket(info);
+      } catch (err) {
+        console.error('[takerbot] rotation error:', err);
+      }
+    })();
+  });
+}
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
-
-let strategy: TakerStrategy | null = null;
 
 async function main(): Promise<void> {
   const privateKey = process.env['PRIVATE_KEY'];
@@ -52,73 +132,39 @@ async function main(): Promise<void> {
     }
   }
 
-  const exchange = new Polymarket({
-    privateKey,
-    verbose: VERBOSE,
-  });
+  exchange = new Polymarket({ privateKey, verbose: VERBOSE });
 
-  let marketConfig;
-
-  if (EXPLICIT_MARKET_ID) {
-    console.log(`[takerbot] using explicit market ID: ${EXPLICIT_MARKET_ID}`);
-    marketConfig = await buildMarketConfig(exchange, EXPLICIT_MARKET_ID);
+  // Try cold-start: load active market already stored by marketDiscovery
+  const existing = await getActiveMarket();
+  if (existing) {
+    console.log('[takerbot] found active market in Redis, starting strategy…');
+    await rotateToMarket(existing);
   } else {
-    console.log('[takerbot] auto-discovering active BTC 15-min market…');
-    const result = await findActiveBtc15MinMarket(exchange);
-    if (!result) {
-      console.error('[takerbot] no active BTC 15-min market found, exiting');
-      process.exit(1);
-    }
-    marketConfig = result.config;
-    console.log(`[takerbot] found market: "${marketConfig.question}"`);
+    // No market yet — subscribe and wait for the first discovery event
+    console.log('[takerbot] no active market in Redis yet — waiting for marketDiscovery…');
+    await subscribeToMarketDiscovery();
   }
-
-  console.log(`[takerbot] market   : ${marketConfig.marketId}`);
-  console.log(`[takerbot] expiry   : ${marketConfig.expiryTime.toISOString()}`);
-  console.log(`[takerbot] strike   : ${marketConfig.strikePrice ?? 'N/A (up/down)'}`);
-  console.log(`[takerbot] dryRun   : ${marketConfig.dryRun}`);
-  console.log(`[takerbot] size     : $${marketConfig.positionSizeUsdc} USDC per trade`);
-  console.log(`[takerbot] edge     : ${(marketConfig.edgeThreshold * 100).toFixed(1)}% required`);
-
-  strategy = new TakerStrategy(exchange, marketConfig);
-
-  strategy.on('error', (err: Error) => {
-    console.error('[takerbot] strategy error:', err);
-  });
-
-  strategy.on('order', (order) => {
-    console.log(`[takerbot] order event: id=${order.id} side=${order.side} price=${order.price}`);
-  });
-
-  await strategy.start();
-
-  // Auto-shutdown 60 s before market expiry
-  const msUntilExpiry = marketConfig.expiryTime.getTime() - Date.now();
-  const shutdownIn = Math.max(0, msUntilExpiry - 60 * 1000);
-
-  console.log(
-    `[takerbot] will auto-shutdown in ${Math.round(shutdownIn / 1000)}s (60s before expiry)`
-  );
-
-  setTimeout(() => {
-    console.log('[takerbot] market approaching expiry — shutting down strategy');
-    void strategy!.stop().then(() => process.exit(0));
-  }, shutdownIn);
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
 
-function gracefulShutdown(signal: string): void {
+async function gracefulShutdown(signal: string): Promise<void> {
   console.log(`[takerbot] ${signal} received — shutting down`);
-  if (strategy) {
-    void strategy.stop().then(() => process.exit(0));
+  if (stopBeforeExpiryTimer) clearTimeout(stopBeforeExpiryTimer);
+  if (currentStrategy) {
+    await currentStrategy.stop();
   } else {
-    process.exit(0);
+    // No active strategy — still need to close any open Redis connections
+    try {
+      const redis = getRedisClient();
+      await redis.quit();
+    } catch { /* ignore */ }
   }
+  process.exit(0);
 }
 
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
 
 main().catch((err) => {
   console.error('[takerbot] fatal error:', err);

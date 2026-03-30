@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { Polymarket } from '@superpredict/ccxt';
 import type { Market } from '@superpredict/ccxt';
-import type { MarketConfig } from '../shared/types.js';
+import type { ActiveMarketInfo, MarketConfig } from '../shared/types.js';
 import {
   EDGE_THRESHOLD,
   MAX_EXPOSURE_USDC,
@@ -128,4 +128,23 @@ function extractStrikePrice(question: string): number | null {
   const raw = match[1]?.replace(/,/g, '') ?? '';
   const price = Number.parseFloat(raw);
   return Number.isFinite(price) && price > 0 ? price : null;
+}
+
+/**
+ * Build a MarketConfig from an ActiveMarketInfo published by marketDiscovery.
+ * All tuning constants are taken from config/constants.ts.
+ */
+export function buildMarketConfigFromInfo(info: ActiveMarketInfo): MarketConfig {
+  return {
+    marketId: info.conditionId,
+    question: info.question,
+    yesTokenId: info.yesTokenId,
+    noTokenId: info.noTokenId,
+    strikePrice: info.strikePrice,
+    expiryTime: new Date(info.expiryTs),
+    positionSizeUsdc: POSITION_SIZE_USDC,
+    edgeThreshold: EDGE_THRESHOLD,
+    maxExposureUsdc: MAX_EXPOSURE_USDC,
+    dryRun: DRY_RUN,
+  };
 }

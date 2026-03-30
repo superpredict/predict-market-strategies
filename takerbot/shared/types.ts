@@ -57,6 +57,26 @@ export interface PortfolioSnapshot {
   ts: number;
 }
 
+// ─── Active Market (published by marketDiscovery) ────────────────────────────
+
+export interface ActiveMarketInfo {
+  /** Polymarket condition ID (hex, starts with 0x) */
+  conditionId: string;
+  question: string;
+  yesTokenId: string;
+  noTokenId: string;
+  /** Strike price in USD if question contains one; null for Up/Down markets */
+  strikePrice: number | null;
+  /** ISO-8601 end date string */
+  endDate: string;
+  /** End date as epoch ms */
+  expiryTs: number;
+  /** Gamma API slug, e.g. "btc-updown-15m-1774851300" */
+  slug: string;
+  /** When this record was discovered (epoch ms) */
+  ts: number;
+}
+
 // ─── Market Config ────────────────────────────────────────────────────────────
 
 export interface MarketConfig {
@@ -84,10 +104,12 @@ export interface MarketConfig {
 
 export const REDIS_KEYS = {
   btcPrice: 'feed:btc:price',
+  btcPriceHistory: 'feed:btc:price:history',
   orderbook: (marketId: string) => `feed:market:${marketId}:orderbook`,
   fairValue: (marketId: string) => `fv:${marketId}`,
   position: (marketId: string) => `position:${marketId}`,
   portfolio: 'portfolio:snapshot',
+  activeMarket: 'market:active-btc15m',
 } as const;
 
 export const REDIS_CHANNELS = {
@@ -95,4 +117,5 @@ export const REDIS_CHANNELS = {
   orderbookUpdated: (marketId: string) => `market:orderbook:updated:${marketId}`,
   fairValueUpdated: (marketId: string) => `fv:updated:${marketId}`,
   orderFilled: (marketId: string) => `order:filled:${marketId}`,
+  newActiveMarket: 'market:new-active-market',
 } as const;

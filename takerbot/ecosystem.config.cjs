@@ -1,13 +1,10 @@
 /**
  * PM2 ecosystem config for takerbot.
  *
- * Start all shared services + one takerbot for the target market:
+ * All processes start with no market-specific CLI arguments.
+ * Market identity is distributed automatically via the marketDiscovery process.
+ *
  *   pm2 start takerbot/ecosystem.config.cjs
- *
- * Start with a specific market:
- *   MARKET_ID=0xabc... YES_TOKEN_ID=0xdef... pm2 start takerbot/ecosystem.config.cjs
- *
- * Production (VPS):
  *   pm2 start takerbot/ecosystem.config.cjs --env production
  *   pm2 save && pm2 startup   # survive reboots
  */
@@ -16,19 +13,15 @@
 
 const path = require('path');
 
-// Use an absolute path so PM2 can resolve files correctly after system reboots,
-// when the working directory at startup may not be the project root.
 const ROOT = path.resolve(__dirname, '..');
 const TSX = path.join(ROOT, 'node_modules/.bin/tsx');
 
-/** Shared env overrides for production */
 const prodEnv = {
   NODE_ENV: 'production',
   DRY_RUN: 'false',
   VERBOSE: 'false',
 };
 
-/** Shared env for development */
 const devEnv = {
   NODE_ENV: 'development',
   DRY_RUN: 'true',
@@ -53,16 +46,31 @@ module.exports = {
       env_production: prodEnv,
     },
 
-    // ── Per-market: Polymarket orderbook feeder ────────────────────────────
-    // Set MARKET_ID and YES_TOKEN_ID env vars before starting.
+    // ── Shared: Market discovery / rotation (one instance) ─────────────────
+    // Polls Gamma API every 60 s; publishes to market:new-active-market on
+    // each new 15-min window so all other processes hot-swap automatically.
+    {
+      name: 'marketDiscovery',
+      script: TSX,
+      args: `${ROOT}/takerbot/feeders/marketDiscovery.ts`,
+      cwd: ROOT,
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '128M',
+      restart_delay: 5000,
+      max_restarts: 20,
+      env: devEnv,
+      env_production: prodEnv,
+    },
+
+    // ── Shared: Polymarket orderbook feeder (one instance) ─────────────────
+    // Subscribes to market:new-active-market and hot-swaps Polymarket WS on
+    // each rotation.  No market-specific args needed.
     {
       name: 'marketPriceFeeder',
       script: TSX,
-      args: [
-        `${ROOT}/takerbot/feeders/marketPriceFeeder.ts`,
-        `--marketid=${process.env.MARKET_ID ?? ''}`,
-        `--tokenid=${process.env.YES_TOKEN_ID ?? ''}`,
-      ].join(' '),
+      args: `${ROOT}/takerbot/feeders/marketPriceFeeder.ts`,
       cwd: ROOT,
       instances: 1,
       autorestart: true,
@@ -74,16 +82,13 @@ module.exports = {
       env_production: prodEnv,
     },
 
-    // ── Per-market: Fair value updater ────────────────────────────────────
+    // ── Shared: Fair value updater (one instance) ──────────────────────────
+    // Subscribes to market:new-active-market and switches FV model on each
+    // rotation.  No market-specific args needed.
     {
       name: 'fairValueUpdater',
       script: TSX,
-      args: [
-        `${ROOT}/takerbot/updater/fairValueUpdater.ts`,
-        `--marketid=${process.env.MARKET_ID ?? ''}`,
-        `--strike=${process.env.STRIKE_PRICE ?? ''}`,
-        `--expiry=${process.env.EXPIRY_TS ?? ''}`,
-      ].join(' '),
+      args: `${ROOT}/takerbot/updater/fairValueUpdater.ts`,
       cwd: ROOT,
       instances: 1,
       autorestart: true,
@@ -95,7 +100,9 @@ module.exports = {
       env_production: prodEnv,
     },
 
-    // ── Per-market: Taker strategy ────────────────────────────────────────
+    // ── Shared: Taker strategy (one instance) ──────────────────────────────
+    // Subscribes to market:new-active-market and restarts TakerStrategy on
+    // each rotation.  No market-specific args needed.
     {
       name: 'takerbot',
       script: TSX,
@@ -106,10 +113,7 @@ module.exports = {
       watch: false,
       max_memory_restart: '256M',
       restart_delay: 5000,
-      max_restarts: 10,
-      // Exit code 0 means intentional shutdown (market expiry). Do not count
-      // these as crashes so max_restarts is not exhausted during normal operation.
-      stop_exit_codes: [0],
+      max_restarts: 20,
       env: devEnv,
       env_production: prodEnv,
     },
