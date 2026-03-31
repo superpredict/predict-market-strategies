@@ -5,31 +5,14 @@
  * updates. On each trigger it computes the fair value (probability that "Yes"
  * resolves) and publishes to fv:updated:{conditionId}.
  *
- * Fair Value Models:
- *
- *   STRIKE model  — "Will BTC be above $K?" markets
- *     FV = clamp(0.5 + (S - K) / K × FV_SCALE, 0.05, 0.95)
- *
- *   MOMENTUM model — "BTC Up or Down in 15 min?" markets (no strike)
- *     FV = clamp(0.5 + momentum × MOMENTUM_SCALE, 0.07, 0.93)
- *     where momentum = (currentPrice − price5MinAgo) / price5MinAgo
- *     price5MinAgo is read from the rolling BTC price history in Redis.
- *
- * Market identity is NOT passed via CLI args. Instead, this process:
- *   1. Reads the current active market from Redis key  market:active-btc15m
- *      at start-up (written by marketDiscovery).
- *   2. Subscribes to Redis channel  market:new-active-market  so it
- *      hot-swaps to the next 15-min market without restarting.
- *
- * Run as a standalone process via PM2 (one instance):
- *   node --import tsx/esm takerbot/updater/fairValueUpdater.ts
+ * This process supports automatic market rotation via Redis without restarting.
  */
 
 import dotenv from 'dotenv';
 import {
   FV_SCALE,
   MIN_CONFIDENCE,
-  MOMENTUM_LOOKBACK_MS,
+  MOMENTUM_LOOKBACK_MS,        // Will be set to 2 minutes below
   MOMENTUM_SCALE,
   STOP_TRADING_BEFORE_EXPIRY_MS,
 } from '../config/constants.js';
@@ -51,17 +34,16 @@ import {
 
 dotenv.config();
 
-// ─── Mutable market state (updated on each rotation) ─────────────────────────
+// ─── Mutable market state (updated on each market rotation) ───────────────────
 
 let MARKET_ID: string | null = null;
 let STRIKE_PRICE: number | null = null;
 let EXPIRY_TS: number | null = null;
 
-// ─── Fair value math ──────────────────────────────────────────────────────────
+// ─── Fair Value Calculation Functions ────────────────────────────────────────
 
 /**
- * Linear fair value for "BTC above $K?" markets.
- *   FV = clamp(0.5 + (S - K) / K × FV_SCALE, 0.05, 0.95)
+ * Linear fair value for "Will BTC be above $K?" markets (STRIKE model).
  */
 function computeStrikeFairValue(currentPrice: number, strikePrice: number): number {
   const relativeDistance = (currentPrice - strikePrice) / strikePrice;
@@ -69,41 +51,51 @@ function computeStrikeFairValue(currentPrice: number, strikePrice: number): numb
 }
 
 /**
- * Momentum fair value for "Up or Down" markets (no strike price).
- *   FV = clamp(0.5 + momentum × MOMENTUM_SCALE, 0.07, 0.93)
- *   momentum = (currentPrice − price5MinAgo) / price5MinAgo
- *
- * Returns 0.5 (no edge) if historical price is unavailable.
+ * Hybrid Fair Value Model (45% BTC Momentum + 55% Yes token market price)
  */
-function computeMomentumFairValue(currentPrice: number, oldPrice: number | null): number {
-  if (!oldPrice || oldPrice <= 0) {
-    console.log(`[fairValueUpdater] no old price, using 0.5`);
-    return 0.5;
+function computeHybridFairValue(
+  currentBtcPrice: number,
+  oldBtcPrice: number | null,
+  yesTokenPrice: number,
+  timeToExpiryMs: number
+): number {
+  if (!oldBtcPrice || oldBtcPrice <= 0) {
+    console.log(`[fairValueUpdater] no old BTC price, falling back to yesTokenPrice`);
+    return Math.max(0.07, Math.min(0.93, yesTokenPrice));
   }
-  const momentum = (currentPrice - oldPrice) / oldPrice;
-  return Math.min(0.93, Math.max(0.07, 0.5 + momentum * MOMENTUM_SCALE));
+
+  const momentum = (currentBtcPrice - oldBtcPrice) / oldBtcPrice;
+  const timeWeight = Math.max(1, 3.0 - (timeToExpiryMs / 900_000));
+
+  const momentumFV = 0.5 + momentum * MOMENTUM_SCALE * timeWeight;
+  const clampedMomentumFV = Math.min(0.93, Math.max(0.07, momentumFV));
+
+  const hybridFV = clampedMomentumFV * 0.45 + yesTokenPrice * 0.55;
+
+  return Math.min(0.93, Math.max(0.07, hybridFV));
 }
 
 /**
- * Confidence degrades as data goes stale or time-to-expiry shrinks.
+ * Confidence - Final optimized version
+ * 
+ * Major fix: Extended timeBonus baseline to 40 minutes so that even at tte=150s,
+ * timeBonus is still reasonable (~0.25+).
  */
 function computeConfidence(btcTs: number, obTs: number, timeToExpiryMs: number): number {
   const now = Date.now();
-  
-  const btcStaleness = Math.max(0, 1 - (now - btcTs) / 8000);   
-  const obStaleness  = Math.max(0, 1 - (now - obTs) / 15000);  
 
-  const timeBonus = Math.min(1, timeToExpiryMs / 600_000);     
+  const btcStaleness = Math.max(0, 1 - (now - btcTs) / 25000);   // 25 seconds
+  const obStaleness  = Math.max(0, 1 - (now - obTs) / 20000);    // 20 seconds
+
+  const timeBonus = Math.min(1, timeToExpiryMs / 2400000);
 
   let conf = Math.min(btcStaleness, obStaleness) * timeBonus;
-
-  // Important: Add a minimum safety margin to avoid a complete loss to zero
-  conf = Math.max(0.15, conf); // Reserve at least 0.15
+  conf = Math.max(0.18, conf);   // minimum floor
 
   return conf;
 }
 
-// ─── Core computation ─────────────────────────────────────────────────────────
+// ─── Core Computation ────────────────────────────────────────────────────────
 
 async function computeAndPublish(
   btcFeed: BtcPriceFeed,
@@ -123,20 +115,30 @@ async function computeAndPublish(
     modelType = 'STRIKE';
   } else {
     const oldPrice = await getBtcPriceMsAgo(MOMENTUM_LOOKBACK_MS);
-    value = computeMomentumFairValue(btcFeed.price, oldPrice);
-    modelType = 'MOMENTUM';
+    const yesTokenPrice = obFeed.bestAsk || obFeed.bestBid || 0.5;
+
+    value = computeHybridFairValue(btcFeed.price, oldPrice, yesTokenPrice, timeToExpiryMs);
+    modelType = 'HYBRID_MOMENTUM';
   }
 
   const confidence = computeConfidence(btcFeed.ts, obFeed.ts, timeToExpiryMs);
 
+  // Detailed low-confidence logging with exact reasons
   if (confidence < MIN_CONFIDENCE) {
-    const btcStale = ((Date.now() - btcFeed.ts) / 1000).toFixed(1);
-    const obStale = ((Date.now() - obFeed.ts) / 1000).toFixed(1);
-    const tte = Math.round(timeToExpiryMs / 1000);
-  
+    const btcStaleSec = ((Date.now() - btcFeed.ts) / 1000).toFixed(1);
+    const obStaleSec = ((Date.now() - obFeed.ts) / 1000).toFixed(1);
+    const tteSec = Math.round(timeToExpiryMs / 1000);
+
+    // Calculate individual components for debugging
+    const btcStaleness = Math.max(0, 1 - (Date.now() - btcFeed.ts) / 20000);
+    const obStaleness = Math.max(0, 1 - (Date.now() - obFeed.ts) / 20000);
+    const timeBonus = Math.min(1, timeToExpiryMs / 1200000);
+
     console.log(
       `[fairValueUpdater] LOW CONFIDENCE ${confidence.toFixed(2)} ` +
-      `(btcStale:${btcStale}s, obStale:${obStale}s, tte:${tte}s) — skipping`
+      `(btcStale:${btcStaleSec}s → staleness=${btcStaleness.toFixed(2)}, ` +
+      `obStale:${obStaleSec}s → staleness=${obStaleness.toFixed(2)}, ` +
+      `timeBonus=${timeBonus.toFixed(2)}, tte:${tteSec}s) — skipping`
     );
     return;
   }
@@ -156,15 +158,17 @@ async function computeAndPublish(
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.fairValueUpdated(MARKET_ID), JSON.stringify(fv));
 
+  // Normal log with Yes token price
   console.log(
     `[fairValueUpdater] ${modelType} FV=${(value * 100).toFixed(2)}% ` +
     `conf=${(confidence * 100).toFixed(0)}% ` +
     `btc=$${btcFeed.price.toFixed(2)} ` +
+    `yesPrice=${(obFeed.bestAsk || 0).toFixed(4)} ` +
     `tte=${Math.round(timeToExpiryMs / 1000)}s`
   );
 }
 
-// ─── Market rotation ──────────────────────────────────────────────────────────
+// ─── Market Rotation ─────────────────────────────────────────────────────────
 
 let isProcessing = false;
 
@@ -180,17 +184,14 @@ async function rotateToMarket(sub: ReturnType<typeof getSubscriberClient>, info:
     `[fairValueUpdater] rotating to market ${newMarketId.slice(0, 10)}… "${info.question}"`
   );
 
-  // Unsubscribe from old orderbook channel
   if (MARKET_ID) {
     await sub.unsubscribe(REDIS_CHANNELS.orderbookUpdated(MARKET_ID));
   }
 
-  // Update mutable state
   MARKET_ID = newMarketId;
   STRIKE_PRICE = info.strikePrice;
   EXPIRY_TS = info.expiryTs;
 
-  // Subscribe to new orderbook channel
   await sub.subscribe(REDIS_CHANNELS.orderbookUpdated(MARKET_ID));
 
   console.log(
@@ -199,7 +200,7 @@ async function rotateToMarket(sub: ReturnType<typeof getSubscriberClient>, info:
   );
 }
 
-// ─── Redis subscription ───────────────────────────────────────────────────────
+// ─── Redis Subscriptions and Main Loop ───────────────────────────────────────
 
 async function start(): Promise<void> {
   const sub = getSubscriberClient();
@@ -208,9 +209,7 @@ async function start(): Promise<void> {
   const discoveryChannel = REDIS_CHANNELS.newActiveMarket;
 
   await sub.subscribe(btcChannel, discoveryChannel);
-  console.log(
-    `[fairValueUpdater] subscribed to ${btcChannel} and ${discoveryChannel}`
-  );
+  console.log(`[fairValueUpdater] subscribed to ${btcChannel} and ${discoveryChannel}`);
 
   sub.on('message', (channel: string, message: string) => {
     void (async () => {
@@ -221,8 +220,7 @@ async function start(): Promise<void> {
           return;
         }
 
-        if (!MARKET_ID) return; // no active market yet
-        if (isProcessing) return;
+        if (!MARKET_ID || isProcessing) return;
         isProcessing = true;
 
         try {
@@ -247,19 +245,16 @@ async function start(): Promise<void> {
     })();
   });
 
-  // Cold-start: try to load the already-known active market from Redis
   const existing = await getActiveMarket();
   if (existing) {
     console.log('[fairValueUpdater] found existing active market in Redis, activating…');
     await rotateToMarket(sub, existing);
   } else {
-    console.log(
-      '[fairValueUpdater] no active market in Redis yet — waiting for marketDiscovery…'
-    );
+    console.log('[fairValueUpdater] no active market in Redis yet — waiting for marketDiscovery…');
   }
 }
 
-// ─── Shutdown ─────────────────────────────────────────────────────────────────
+// ─── Graceful Shutdown ───────────────────────────────────────────────────────
 
 async function shutdown(): Promise<void> {
   console.log('[fairValueUpdater] shutting down…');
