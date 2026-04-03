@@ -5,22 +5,28 @@
  * updates. On each trigger it computes the fair value (probability that "Yes"
  * resolves) and publishes to fv:updated:{conditionId}.
  *
- * This process supports automatic market rotation via Redis without restarting.
+ * Model: STRIKE only.
+ *   FV = clamp(0.5 + (S − K) / K × FV_SCALE, 0.05, 0.95)
+ *   K = Chainlink BTC/USD price at window open (set by marketDiscovery)
+ *   S = current Binance BTC mid price
+ *
+ * BTC staleness guard:
+ *   If the BTC feed is older than BTC_STALE_FORBID_MS, trading is hard-forbidden
+ *   (early return). Confidence therefore only reflects orderbook freshness and
+ *   time-to-expiry.
  */
 
 import dotenv from 'dotenv';
 import {
+  BTC_STALE_FORBID_MS,
   FV_SCALE,
   MIN_CONFIDENCE,
-  MOMENTUM_LOOKBACK_MS,        // Will be set to 2 minutes below
-  MOMENTUM_SCALE,
   STOP_TRADING_BEFORE_EXPIRY_MS,
 } from '../config/constants.js';
 import { closeRedis, getRedisClient, getSubscriberClient } from '../shared/redis.js';
 import {
   getActiveMarket,
   getBtcPrice,
-  getBtcPriceMsAgo,
   getOrderbook,
   setFairValue,
 } from '../shared/state.js';
@@ -40,10 +46,10 @@ let MARKET_ID: string | null = null;
 let STRIKE_PRICE: number | null = null;
 let EXPIRY_TS: number | null = null;
 
-// ─── Fair Value Calculation Functions ────────────────────────────────────────
+// ─── Fair Value Calculation ───────────────────────────────────────────────────
 
 /**
- * Linear fair value for "Will BTC be above $K?" markets (STRIKE model).
+ * FV = clamp(0.5 + (S − K) / K × FV_SCALE, 0.05, 0.95)
  */
 function computeStrikeFairValue(currentPrice: number, strikePrice: number): number {
   const relativeDistance = (currentPrice - strikePrice) / strikePrice;
@@ -51,48 +57,14 @@ function computeStrikeFairValue(currentPrice: number, strikePrice: number): numb
 }
 
 /**
- * Hybrid Fair Value Model (45% BTC Momentum + 55% Yes token market price)
+ * Confidence score based on orderbook freshness and time-to-expiry.
+ * BTC staleness is handled upstream via a hard forbid, not here.
  */
-function computeHybridFairValue(
-  currentBtcPrice: number,
-  oldBtcPrice: number | null,
-  yesTokenPrice: number,
-  timeToExpiryMs: number
-): number {
-  if (!oldBtcPrice || oldBtcPrice <= 0) {
-    console.log(`[fairValueUpdater] no old BTC price, falling back to yesTokenPrice`);
-    return Math.max(0.07, Math.min(0.93, yesTokenPrice));
-  }
-
-  const momentum = (currentBtcPrice - oldBtcPrice) / oldBtcPrice;
-  const timeWeight = Math.max(1, 3.0 - (timeToExpiryMs / 900_000));
-
-  const momentumFV = 0.5 + momentum * MOMENTUM_SCALE * timeWeight;
-  const clampedMomentumFV = Math.min(0.93, Math.max(0.07, momentumFV));
-
-  const hybridFV = clampedMomentumFV * 0.45 + yesTokenPrice * 0.55;
-
-  return Math.min(0.93, Math.max(0.07, hybridFV));
-}
-
-/**
- * Confidence - Final optimized version
- * 
- * Major fix: Extended timeBonus baseline to 40 minutes so that even at tte=150s,
- * timeBonus is still reasonable (~0.25+).
- */
-function computeConfidence(btcTs: number, obTs: number, timeToExpiryMs: number): number {
+function computeConfidence(obTs: number, timeToExpiryMs: number): number {
   const now = Date.now();
-
-  const btcStaleness = Math.max(0, 1 - (now - btcTs) / 25000);   // 25 seconds
-  const obStaleness  = Math.max(0, 1 - (now - obTs) / 20000);    // 20 seconds
-
-  const timeBonus = Math.min(1, timeToExpiryMs / 2400000);
-
-  let conf = Math.min(btcStaleness, obStaleness) * timeBonus;
-  conf = Math.max(0.18, conf);   // minimum floor
-
-  return conf;
+  const obStaleness = Math.max(0, 1 - (now - obTs) / 20_000); // 20 s window
+  const timeBonus = Math.min(1, timeToExpiryMs / 2_400_000);
+  return Math.max(0.18, obStaleness * timeBonus);
 }
 
 // ─── Core Computation ────────────────────────────────────────────────────────
@@ -104,41 +76,37 @@ async function computeAndPublish(
   if (!MARKET_ID) return;
 
   const now = Date.now();
+
+  // ── Hard-forbid on stale BTC ──────────────────────────────────────────────
+  const btcAgeMs = now - btcFeed.ts;
+  if (btcAgeMs > BTC_STALE_FORBID_MS) {
+    console.log(
+      `[fairValueUpdater] STALE BTC (${(btcAgeMs / 1000).toFixed(1)}s > ` +
+      `${BTC_STALE_FORBID_MS / 1000}s) — forbidden`
+    );
+    return;
+  }
+
+  // ── Require a valid strike price ──────────────────────────────────────────
+  if (STRIKE_PRICE === null) {
+    console.log('[fairValueUpdater] no strike price — forbidden (chainlink feeder not running?)');
+    return;
+  }
+
   const expiryMs = EXPIRY_TS ?? now + 15 * 60 * 1000;
   const timeToExpiryMs = expiryMs - now;
 
-  let value: number;
-  let modelType: string;
+  if (timeToExpiryMs < STOP_TRADING_BEFORE_EXPIRY_MS) return;
 
-  if (STRIKE_PRICE !== null && STRIKE_PRICE > 0) {
-    value = computeStrikeFairValue(btcFeed.price, STRIKE_PRICE);
-    modelType = 'STRIKE';
-  } else {
-    const oldPrice = await getBtcPriceMsAgo(MOMENTUM_LOOKBACK_MS);
-    const yesTokenPrice = obFeed.bestAsk || obFeed.bestBid || 0.5;
+  const value = computeStrikeFairValue(btcFeed.price, STRIKE_PRICE);
+  const confidence = computeConfidence(obFeed.ts, timeToExpiryMs);
 
-    value = computeHybridFairValue(btcFeed.price, oldPrice, yesTokenPrice, timeToExpiryMs);
-    modelType = 'HYBRID_MOMENTUM';
-  }
-
-  const confidence = computeConfidence(btcFeed.ts, obFeed.ts, timeToExpiryMs);
-
-  // Detailed low-confidence logging with exact reasons
   if (confidence < MIN_CONFIDENCE) {
-    const btcStaleSec = ((Date.now() - btcFeed.ts) / 1000).toFixed(1);
-    const obStaleSec = ((Date.now() - obFeed.ts) / 1000).toFixed(1);
+    const obStaleSec = ((now - obFeed.ts) / 1000).toFixed(1);
     const tteSec = Math.round(timeToExpiryMs / 1000);
-
-    // Calculate individual components for debugging
-    const btcStaleness = Math.max(0, 1 - (Date.now() - btcFeed.ts) / 20000);
-    const obStaleness = Math.max(0, 1 - (Date.now() - obFeed.ts) / 20000);
-    const timeBonus = Math.min(1, timeToExpiryMs / 1200000);
-
     console.log(
       `[fairValueUpdater] LOW CONFIDENCE ${confidence.toFixed(2)} ` +
-      `(btcStale:${btcStaleSec}s → staleness=${btcStaleness.toFixed(2)}, ` +
-      `obStale:${obStaleSec}s → staleness=${obStaleness.toFixed(2)}, ` +
-      `timeBonus=${timeBonus.toFixed(2)}, tte:${tteSec}s) — skipping`
+      `(obStale:${obStaleSec}s, tte:${tteSec}s) — skipping`
     );
     return;
   }
@@ -150,6 +118,7 @@ async function computeAndPublish(
     btcPrice: btcFeed.price,
     strikePrice: STRIKE_PRICE,
     timeToExpiryMs,
+    publishedAt: now,
     ts: now,
   };
 
@@ -158,12 +127,12 @@ async function computeAndPublish(
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.fairValueUpdated(MARKET_ID), JSON.stringify(fv));
 
-  // Normal log with Yes token price
   console.log(
-    `[fairValueUpdater] ${modelType} FV=${(value * 100).toFixed(2)}% ` +
+    `[fairValueUpdater] STRIKE FV=${(value * 100).toFixed(2)}% ` +
     `conf=${(confidence * 100).toFixed(0)}% ` +
     `btc=$${btcFeed.price.toFixed(2)} ` +
-    `yesPrice=${(obFeed.bestAsk || 0).toFixed(4)} ` +
+    `strike=$${STRIKE_PRICE.toFixed(2)} ` +
+    `yesAsk=${(obFeed.bestAsk || 0).toFixed(4)} ` +
     `tte=${Math.round(timeToExpiryMs / 1000)}s`
   );
 }
@@ -172,7 +141,10 @@ async function computeAndPublish(
 
 let isProcessing = false;
 
-async function rotateToMarket(sub: ReturnType<typeof getSubscriberClient>, info: ActiveMarketInfo): Promise<void> {
+async function rotateToMarket(
+  sub: ReturnType<typeof getSubscriberClient>,
+  info: ActiveMarketInfo
+): Promise<void> {
   const newMarketId = info.conditionId;
 
   if (newMarketId === MARKET_ID) {
@@ -189,14 +161,23 @@ async function rotateToMarket(sub: ReturnType<typeof getSubscriberClient>, info:
   }
 
   MARKET_ID = newMarketId;
-  STRIKE_PRICE = info.strikePrice;
   EXPIRY_TS = info.expiryTs;
+  STRIKE_PRICE = info.strikePrice; // set by marketDiscovery from Chainlink history
+
+  if (STRIKE_PRICE === null) {
+    console.warn(
+      '[fairValueUpdater] strike price is null — trading forbidden until next rotation ' +
+      '(is chainlinkPriceFeeder running?)'
+    );
+  } else {
+    console.log(`[fairValueUpdater] STRIKE_PRICE=$${STRIKE_PRICE.toFixed(2)} (from Chainlink)`);
+  }
 
   await sub.subscribe(REDIS_CHANNELS.orderbookUpdated(MARKET_ID));
 
   console.log(
     `[fairValueUpdater] subscribed to orderbook for market ${MARKET_ID.slice(0, 10)}… ` +
-    `strike=${STRIKE_PRICE ?? 'N/A'} expiry=${info.endDate}`
+    `expiry=${info.endDate}`
   );
 }
 

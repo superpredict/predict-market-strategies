@@ -19,7 +19,7 @@
 import dotenv from 'dotenv';
 import { MARKET_DISCOVERY_POLL_MS } from '../config/constants.js';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { setActiveMarket } from '../shared/state.js';
+import { getChainlinkStrikeForWindow, setActiveMarket } from '../shared/state.js';
 import { REDIS_CHANNELS, type ActiveMarketInfo } from '../shared/types.js';
 
 dotenv.config();
@@ -47,18 +47,6 @@ interface GammaMarketResponse {
 /** Unix timestamp (seconds) for the start of the current 15-min window. */
 function currentWindowTimestamp(): number {
   return Math.floor(Date.now() / 1000 / WINDOW_SECONDS) * WINDOW_SECONDS;
-}
-
-/**
- * Extract a USD strike price from a question string.
- * Returns null for "Up or Down" style questions that have no dollar amount.
- */
-function extractStrikePrice(question: string): number | null {
-  const match = /\$\s*([\d,]+(?:\.\d+)?)/i.exec(question);
-  if (!match) return null;
-  const raw = match[1]?.replace(/,/g, '') ?? '';
-  const price = Number.parseFloat(raw);
-  return Number.isFinite(price) && price > 0 ? price : null;
 }
 
 async function fetchMarketBySlug(slug: string): Promise<GammaMarketResponse | null> {
@@ -115,12 +103,18 @@ async function checkAndPublish(): Promise<void> {
     return;
   }
 
+  // ── Strike price: Chainlink BTC/USD price at window open ──────────────────
+  // Polymarket's strike is the Chainlink oracle reading whose unix-second
+  // timestamp is exactly the 15-min boundary (divisible by 900).
+  // getChainlinkStrikeForWindow finds the entry where chainlinkTs/1000 === windowTs.
+  const strikePrice = await getChainlinkStrikeForWindow(windowTs);
+
   const info: ActiveMarketInfo = {
     conditionId: market.conditionId,
     question: market.question,
     yesTokenId: tokenIds[0]!,
     noTokenId: tokenIds[1]!,
-    strikePrice: extractStrikePrice(market.question),
+    strikePrice,
     endDate: market.endDate,
     expiryTs: new Date(market.endDate).getTime(),
     slug: market.slug,
@@ -134,13 +128,18 @@ async function checkAndPublish(): Promise<void> {
 
   lastPublishedWindowTs = windowTs;
 
+  const strikeLine =
+    info.strikePrice !== null
+      ? `$${info.strikePrice.toLocaleString()} (chainlink)`
+      : 'N/A — chainlinkPriceFeeder not running yet';
+
   console.log(
     `[marketDiscovery] published market` +
     `\n  conditionId : ${info.conditionId}` +
     `\n  question    : ${info.question}` +
     `\n  yesTokenId  : ${info.yesTokenId.slice(0, 16)}…` +
     `\n  expiry      : ${info.endDate}` +
-    `\n  strikePrice : ${info.strikePrice ?? 'N/A (up/down)'}`
+    `\n  strikePrice : ${strikeLine}`
   );
 }
 

@@ -127,8 +127,9 @@ Terminal output:
 Market identity is discovered automatically via `marketDiscovery` — no per-process CLI arguments are needed.
 
 ```sh
-# Debug mode (recommended for testing) — open 6 terminals:
+# Debug mode (recommended for testing) — open 7 terminals:
 node --import tsx/esm takerbot/feeders/btcPriceFeeder.ts
+node --import tsx/esm takerbot/feeders/chainlinkPriceFeeder.ts
 node --import tsx/esm takerbot/feeders/marketDiscovery.ts
 node --import tsx/esm takerbot/feeders/marketPriceFeeder.ts
 node --import tsx/esm takerbot/updater/fairValueUpdater.ts

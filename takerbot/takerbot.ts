@@ -7,12 +7,13 @@
  * On startup:
  *   1. Reads the current active market from Redis key  market:active-btc15m.
  *   2. Starts TakerStrategy for that market.
- *   3. Subscribes to  market:new-active-market  for live rotation events.
  *
- * On each rotation event (every 15 min):
- *   4. Stops the old strategy (closes Redis, unsubscribes WS).
- *   5. Starts a fresh strategy for the new market.
- *   6. Re-subscribes to  market:new-active-market  on the new subscriber client.
+ * TakerStrategy now owns market rotation: it subscribes to
+ * market:new-active-market internally and hot-swaps to the next 15-min window
+ * without a process restart (same pattern as marketPriceFeeder).
+ *
+ * If no active market exists yet, takerbot subscribes once for the very first
+ * market event, then hands off rotation entirely to the strategy.
  *
  * Environment variables (see deploy/.env.example):
  *   PRIVATE_KEY   Ethereum wallet private key (required when DRY_RUN=false)
@@ -22,7 +23,7 @@
 import dotenv from 'dotenv';
 import { Polymarket } from '@superpredict/ccxt';
 import { buildMarketConfigFromInfo } from './config/markets.js';
-import { STOP_TRADING_BEFORE_EXPIRY_MS, VERBOSE } from './config/constants.js';
+import { VERBOSE } from './config/constants.js';
 import { getRedisClient, getSubscriberClient } from './shared/redis.js';
 import { getActiveMarket } from './shared/state.js';
 import { REDIS_CHANNELS, type ActiveMarketInfo } from './shared/types.js';
@@ -34,23 +35,14 @@ dotenv.config();
 
 let exchange: Polymarket;
 let currentStrategy: TakerStrategy | null = null;
-let stopBeforeExpiryTimer: ReturnType<typeof setTimeout> | null = null;
 
-// ─── Market rotation ──────────────────────────────────────────────────────────
+// ─── Strategy launcher ────────────────────────────────────────────────────────
 
-async function rotateToMarket(info: ActiveMarketInfo): Promise<void> {
+async function startStrategy(info: ActiveMarketInfo): Promise<void> {
   console.log(
-    `[takerbot] rotating to market ${info.conditionId.slice(0, 10)}… "${info.question}"`
+    `[takerbot] starting strategy for market ${info.conditionId.slice(0, 10)}… "${info.question}"`
   );
 
-  // Cancel any pending pre-expiry stop timer from the previous market
-  if (stopBeforeExpiryTimer) {
-    clearTimeout(stopBeforeExpiryTimer);
-    stopBeforeExpiryTimer = null;
-  }
-
-  // Stop old strategy. TakerStrategy.stop() closes the Redis connections so
-  // getSubscriberClient() / getRedisClient() will lazily re-create them below.
   if (currentStrategy) {
     await currentStrategy.stop();
     currentStrategy = null;
@@ -75,47 +67,9 @@ async function rotateToMarket(info: ActiveMarketInfo): Promise<void> {
     console.log(`[takerbot] order: id=${order.id} side=${order.side} price=${order.price}`);
   });
 
+  // TakerStrategy.start() subscribes to market:new-active-market internally,
+  // so all future rotations are handled without takerbot's involvement.
   await currentStrategy.start();
-
-  // Re-subscribe to market:new-active-market on the fresh subscriber client
-  await subscribeToMarketDiscovery();
-
-  // Stop trading STOP_TRADING_BEFORE_EXPIRY_MS before expiry (but don't exit;
-  // the next rotation event will start a new strategy for the next window).
-  const msUntilStop = Math.max(0, info.expiryTs - Date.now() - STOP_TRADING_BEFORE_EXPIRY_MS);
-  stopBeforeExpiryTimer = setTimeout(() => {
-    console.log('[takerbot] market near expiry — stopping strategy; awaiting next market…');
-    void currentStrategy?.stop().then(() => {
-      currentStrategy = null;
-    });
-  }, msUntilStop);
-
-  console.log(
-    `[takerbot] strategy running — will stop ${Math.round(msUntilStop / 1000)}s from now`
-  );
-}
-
-// ─── Market discovery subscription ───────────────────────────────────────────
-
-async function subscribeToMarketDiscovery(): Promise<void> {
-  const sub = getSubscriberClient(); // lazily created / re-created after rotation
-
-  await sub.subscribe(REDIS_CHANNELS.newActiveMarket);
-
-  // Replace any existing listener to avoid duplicate handlers after rotation
-  sub.removeAllListeners('message');
-
-  sub.on('message', (channel: string, message: string) => {
-    if (channel !== REDIS_CHANNELS.newActiveMarket) return;
-    void (async () => {
-      try {
-        const info = JSON.parse(message) as ActiveMarketInfo;
-        await rotateToMarket(info);
-      } catch (err) {
-        console.error('[takerbot] rotation error:', err);
-      }
-    })();
-  });
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -134,23 +88,47 @@ async function main(): Promise<void> {
 
   exchange = new Polymarket({ privateKey, verbose: VERBOSE });
 
+  console.log('[takerbot] Clearing previous active market on startup...');
+  const redis = getRedisClient();
+  await redis.del('market:active-btc15m');   // make sure the key name is correct
+  
   // Try cold-start: load active market already stored by marketDiscovery
   const existing = await getActiveMarket();
   if (existing) {
     console.log('[takerbot] found active market in Redis, starting strategy…');
-    await rotateToMarket(existing);
-  } else {
-    // No market yet — subscribe and wait for the first discovery event
-    console.log('[takerbot] no active market in Redis yet — waiting for marketDiscovery…');
-    await subscribeToMarketDiscovery();
+    await startStrategy(existing);
+    return;
   }
+
+  // No market yet — subscribe once for the very first discovery event,
+  // then the strategy owns all future rotations.
+  console.log('[takerbot] no active market in Redis yet — waiting for marketDiscovery…');
+
+  const sub = getSubscriberClient();
+  await sub.subscribe(REDIS_CHANNELS.newActiveMarket);
+
+  const initialHandler = (channel: string, message: string) => {
+    if (channel !== REDIS_CHANNELS.newActiveMarket) return;
+    // Remove this one-shot handler before doing async work to avoid re-entry
+    sub.off('message', initialHandler);
+    void (async () => {
+      try {
+        const info = JSON.parse(message) as ActiveMarketInfo;
+        await startStrategy(info);
+        // strategy now handles all subsequent rotations
+      } catch (err) {
+        console.error('[takerbot] failed to start strategy on first market event:', err);
+      }
+    })();
+  };
+
+  sub.on('message', initialHandler);
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
 
 async function gracefulShutdown(signal: string): Promise<void> {
   console.log(`[takerbot] ${signal} received — shutting down`);
-  if (stopBeforeExpiryTimer) clearTimeout(stopBeforeExpiryTimer);
   if (currentStrategy) {
     await currentStrategy.stop();
   } else {

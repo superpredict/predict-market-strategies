@@ -32,7 +32,7 @@ export const MAX_EXPOSURE_USDC = 200;
 export const FV_SCALE = 5;
 
 /** Minimum model confidence (0–1) required to trade. */
-export const MIN_CONFIDENCE = 0.22;
+export const MIN_CONFIDENCE = 0.18;
 
 /** Stop trading this many ms before expiry (model breaks down near expiry). */
 export const STOP_TRADING_BEFORE_EXPIRY_MS = 60_000;
@@ -51,24 +51,6 @@ export const MAX_TIME_TO_EXPIRY_MS = 30 * 60 * 1000; // 30 min
 /** How often marketDiscovery polls for a new 15-min window (ms). */
 export const MARKET_DISCOVERY_POLL_MS = 60_000; // 1 min
 
-// ─── Momentum Fair Value Model ────────────────────────────────────────────────
-
-/**
- * Look-back window for momentum FV calculation.
- * We fetch the BTC price from ~5 minutes ago and compare to current price.
- */
-export const MOMENTUM_LOOKBACK_MS = 5 * 60 * 1000; // 5 min
-
-/**
- * Momentum sensitivity.  FV = 0.5 + momentumPct × MOMENTUM_SCALE
- *
- * Examples (MOMENTUM_SCALE = 10):
- *   BTC up +0.5% over 5 min  →  FV = 0.5 + 0.005 × 10 = 0.55
- *   BTC up +2% over 5 min    →  FV = 0.5 + 0.02  × 10 = 0.70
- *   BTC down −1% over 5 min  →  FV = 0.5 − 0.01  × 10 = 0.40
- */
-export const MOMENTUM_SCALE = 30; //10;
-
 // ─── Redis ────────────────────────────────────────────────────────────────────
 
 /** Redis connection URL. Change if Redis runs on a non-default port/host. */
@@ -84,6 +66,13 @@ export const BTC_MIN_PRICE_CHANGE_USD = 3;
 
 /** Reconnect delay on WS disconnect (ms). */
 export const WS_RECONNECT_DELAY_MS = 3_000;
+
+/**
+ * Maximum age of a BTC price feed before fairValueUpdater hard-forbids trading.
+ * Replaces the old btcStaleness factor in confidence — stale BTC is now a
+ * binary forbid rather than a soft confidence penalty.
+ */
+export const BTC_STALE_FORBID_MS = 30_000; // 30 seconds
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 

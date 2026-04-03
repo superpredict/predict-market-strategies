@@ -11,6 +11,11 @@
  * Order type: FAK (Fill And Kill) — acts as a market order on Polymarket.
  * Position: capped by maxExposureUsdc to limit risk per market.
  *
+ * Market rotation:
+ *   Subscribes to  market:new-active-market  at startup so it hot-swaps
+ *   to the next 15-min window without a process restart, exactly mirroring
+ *   the approach used by marketPriceFeeder.
+ *
  * The slow-tick (default 10 s) also polls Redis in case pub/sub messages
  * were missed, and handles clean-up near expiry.
  */
@@ -24,10 +29,12 @@ import {
   STRATEGY_SLOW_TICK_MS,
   VERBOSE,
 } from '../config/constants.js';
+import { buildMarketConfigFromInfo } from '../config/markets.js';
 import { closeRedis, getRedisClient, getSubscriberClient } from '../shared/redis.js';
 import { getFairValue, getOrderbook, getPosition, setPosition } from '../shared/state.js';
 import {
   REDIS_CHANNELS,
+  type ActiveMarketInfo,
   type FairValue,
   type MarketConfig,
   type PortfolioPosition,
@@ -38,6 +45,14 @@ import {
 export class TakerStrategy extends Strategy {
   private marketConfig: MarketConfig;
   private isProcessing = false;
+  private lastProcessedFvTs = 0;
+
+  private latencyStats: number[] = [];
+
+  /** Tracks the currently-subscribed fair-value channel so we can unsubscribe on rotation. */
+  private currentFvChannel: string | null = null;
+  /** Bound handler reference so we can call sub.off() on rotation. */
+  private fvMessageHandler: ((ch: string, msg: string) => void) | null = null;
 
   constructor(exchange: Exchange, config: MarketConfig) {
     super(exchange, config.marketId, {
@@ -52,6 +67,7 @@ export class TakerStrategy extends Strategy {
 
   override async start(): Promise<void> {
     await super.start();
+    await this.subscribeToMarketRotation();
     await this.subscribeToFairValueUpdates();
     console.log(`[takerStrategy] started for market ${this.marketConfig.marketId}`);
   }
@@ -64,15 +80,72 @@ export class TakerStrategy extends Strategy {
     await this.evaluate(fv);
   }
 
+  // ─── Market rotation: subscribe to new-active-market ────────────────────────
+
+  private async subscribeToMarketRotation(): Promise<void> {
+    const sub = getSubscriberClient();
+    await sub.subscribe(REDIS_CHANNELS.newActiveMarket);
+
+    sub.on('message', (channel: string, message: string) => {
+      if (channel !== REDIS_CHANNELS.newActiveMarket) return;
+      void (async () => {
+        try {
+          const info = JSON.parse(message) as ActiveMarketInfo;
+          await this.switchMarket(info);
+        } catch (err) {
+          console.error('[takerStrategy] market rotation error:', err);
+        }
+      })();
+    });
+
+    console.log(`[takerStrategy] subscribed to ${REDIS_CHANNELS.newActiveMarket} for market rotation`);
+  }
+
+  // ─── Market rotation: hot-swap to a new market ───────────────────────────────
+
+  private async switchMarket(info: ActiveMarketInfo): Promise<void> {
+    if (info.conditionId === this.marketConfig.marketId) {
+      console.log(`[takerStrategy] already on market ${info.conditionId.slice(0, 10)}…, skipping`);
+      return;
+    }
+
+    console.log(
+      `[takerStrategy] ↩ rotating ${this.marketConfig.marketId.slice(0, 10)}… → ` +
+      `${info.conditionId.slice(0, 10)}… "${info.question}"`
+    );
+
+    // Build a fresh config from the incoming market info (trading params from constants)
+    this.marketConfig = buildMarketConfigFromInfo(info);
+
+    // Reset per-market state so the first evaluate() on the new market starts clean
+    this.isProcessing = false;
+    this.lastProcessedFvTs = 0;
+    this.latencyStats = [];
+
+    // Re-subscribe the fair-value channel for the new market
+    await this.subscribeToFairValueUpdates();
+
+    console.log(
+      `[takerStrategy] now trading ${info.conditionId.slice(0, 10)}… ` +
+      `exp=${info.endDate} strike=${info.strikePrice ?? 'N/A'}`
+    );
+  }
+
   // ─── Fast path: react to Redis pub/sub FV updates ───────────────────────────
 
   private async subscribeToFairValueUpdates(): Promise<void> {
     const sub = getSubscriberClient();
+
+    // Unsubscribe from the previous market's channel before switching
+    if (this.currentFvChannel && this.fvMessageHandler) {
+      await sub.unsubscribe(this.currentFvChannel);
+      sub.off('message', this.fvMessageHandler);
+    }
+
     const channel = REDIS_CHANNELS.fairValueUpdated(this.marketConfig.marketId);
+    this.currentFvChannel = channel;
 
-    await sub.subscribe(channel);
-
-    sub.on('message', (ch: string, message: string) => {
+    this.fvMessageHandler = (ch: string, message: string) => {
       if (ch !== channel) return;
       void (async () => {
         try {
@@ -82,53 +155,79 @@ export class TakerStrategy extends Strategy {
           console.error('[takerStrategy] pub/sub error:', err);
         }
       })();
-    });
+    };
+
+    await sub.subscribe(channel);
+    sub.on('message', this.fvMessageHandler);
 
     console.log(`[takerStrategy] subscribed to ${channel}`);
   }
 
   // ─── Core decision logic ──────────────────────────────────────────────────────
+private async evaluate(fv: FairValue): Promise<void> {
+  if (this.isProcessing) return;           // prevent concurrent evaluations
 
-  private async evaluate(fv: FairValue): Promise<void> {
-    if (this.isProcessing) return; // prevent concurrent evaluations
-    this.isProcessing = true;
+  this.isProcessing = true;
 
-    try {
-      if (!this.shouldTrade(fv)) return;
+  try {
+    const fvReceivedAt = Date.now();
+    const totalLatencyMs = fvReceivedAt - fv.publishedAt;
 
-      const ob = await getOrderbook(this.marketConfig.marketId);
-      if (!ob) return;
+    const now = Date.now();
+    const timeSinceLast = now - this.lastProcessedFvTs;
 
-      const { bestBid, bestAsk } = ob;
-      const { value: fairValue, confidence } = fv;
-      const { edgeThreshold, positionSizeUsdc, maxExposureUsdc, dryRun } = this.marketConfig;
-
-      const position = await getPosition(this.marketConfig.marketId);
-      const currentExposure = position ? Math.abs(position.size) * position.avgEntryPrice : 0;
-
-      if (currentExposure >= maxExposureUsdc) {
-        console.log(`[takerStrategy] max exposure reached ($${maxExposureUsdc}), skipping`);
-        return;
+    // Skip if FV updates come too frequently (debounce)
+    if (timeSinceLast < 50) {
+      if (Math.random() < 0.08) {   
+        console.log(`[takerStrategy] ⏭️ skipped FV (too frequent: ${timeSinceLast}ms ago)`);
       }
-
-      const buyEdge = fairValue - bestAsk;
-      const sellEdge = bestBid - fairValue;
-
-      const logPrefix = `[takerStrategy] FV=${(fairValue * 100).toFixed(2)}% conf=${(confidence * 100).toFixed(0)}%`;
-
-      if (buyEdge >= edgeThreshold) {
-        console.log(`${logPrefix} BUY edge=${(buyEdge * 100).toFixed(2)}% ask=${bestAsk}`);
-        await this.executeTakerOrder('Yes', OrderSide.BUY, bestAsk, positionSizeUsdc, dryRun);
-      } else if (sellEdge >= edgeThreshold) {
-        console.log(`${logPrefix} SELL edge=${(sellEdge * 100).toFixed(2)}% bid=${bestBid}`);
-        await this.executeTakerOrder('Yes', OrderSide.SELL, bestBid, positionSizeUsdc, dryRun);
-      } else {
-        console.log(`${logPrefix} no edge (buyEdge=${(buyEdge * 100).toFixed(2)}% sellEdge=${(sellEdge * 100).toFixed(2)}%)`);
-      }
-    } finally {
-      this.isProcessing = false;
+      return;
     }
+
+    this.lastProcessedFvTs = now;
+
+    console.log(`[latency] Total FV → Order: ${totalLatencyMs}ms | FV=${(fv.value*100).toFixed(2)}% conf=${(fv.confidence*100).toFixed(1)}%`);
+
+    if (totalLatencyMs > 50) {
+      console.warn(`[latency] ⚠️ SLOW: ${totalLatencyMs}ms (target < 50ms)`);
+    }
+
+    // Safety checks
+    if (!this.shouldTrade(fv)) return;
+
+    const ob = await getOrderbook(this.marketConfig.marketId);
+    if (!ob) return;
+
+    const { bestBid, bestAsk } = ob;
+    const { value: fairValue, confidence } = fv;
+    const { edgeThreshold, positionSizeUsdc, maxExposureUsdc, dryRun } = this.marketConfig;
+
+    const position = await getPosition(this.marketConfig.marketId);
+    const currentExposure = position ? Math.abs(position.size) * position.avgEntryPrice : 0;
+
+    if (currentExposure >= maxExposureUsdc) {
+      console.log(`[takerStrategy] max exposure reached ($${maxExposureUsdc}), skipping`);
+      return;
+    }
+
+    const buyEdge = fairValue - bestAsk;
+    const sellEdge = bestBid - fairValue;
+
+    const logPrefix = `[takerStrategy] FV=${(fairValue * 100).toFixed(2)}% conf=${(confidence * 100).toFixed(0)}%`;
+
+    if (buyEdge >= edgeThreshold) {
+      console.log(`${logPrefix} BUY edge=${(buyEdge * 100).toFixed(2)}% ask=${bestAsk}`);
+      await this.executeTakerOrder('Yes', OrderSide.BUY, bestAsk, positionSizeUsdc, dryRun);
+    } else if (sellEdge >= edgeThreshold) {
+      console.log(`${logPrefix} SELL edge=${(sellEdge * 100).toFixed(2)}% bid=${bestBid}`);
+      await this.executeTakerOrder('Yes', OrderSide.SELL, bestBid, positionSizeUsdc, dryRun);
+    } else {
+      console.log(`${logPrefix} no edge (buyEdge=${(buyEdge * 100).toFixed(2)}% sellEdge=${(sellEdge * 100).toFixed(2)}%)`);
+    }
+  } finally {
+    this.isProcessing = false;   
   }
+}
 
   // ─── Checks ───────────────────────────────────────────────────────────────────
   private shouldTrade(fv: FairValue): boolean {

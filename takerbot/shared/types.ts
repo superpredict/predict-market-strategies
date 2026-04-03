@@ -12,6 +12,15 @@ export interface BtcPriceFeed {
   ts: number; // epoch ms
 }
 
+/** Chainlink BTC/USD price snapshot from Polymarket's live-data WS. */
+export interface ChainlinkBtcPriceFeed {
+  price: number;
+  /** Epoch ms when WE received the message (used for staleness check). */
+  ts: number;
+  /** Timestamp reported inside the Chainlink payload (epoch ms). */
+  chainlinkTs: number;
+}
+
 export interface MarketOrderbookFeed {
   marketId: string;
   yesTokenId: string;
@@ -33,6 +42,7 @@ export interface FairValue {
   confidence: number;
   btcPrice: number;
   strikePrice: number | null;
+  publishedAt: number;
   timeToExpiryMs: number;
   ts: number; // epoch ms
 }
@@ -65,7 +75,7 @@ export interface ActiveMarketInfo {
   question: string;
   yesTokenId: string;
   noTokenId: string;
-  /** Strike price in USD if question contains one; null for Up/Down markets */
+  /** Strike price in USD — Chainlink BTC/USD price at window open; null if Chainlink unavailable */
   strikePrice: number | null;
   /** ISO-8601 end date string */
   endDate: string;
@@ -87,7 +97,7 @@ export interface MarketConfig {
   yesTokenId: string;
   /** Token ID for the "No" outcome */
   noTokenId: string;
-  /** Strike price (USD) for "above/below" type markets; null for "up/down" */
+  /** Strike price in USD — Chainlink BTC/USD price at window open */
   strikePrice: number | null;
   expiryTime: Date;
   /** USDC amount per trade */
@@ -104,7 +114,8 @@ export interface MarketConfig {
 
 export const REDIS_KEYS = {
   btcPrice: 'feed:btc:price',
-  btcPriceHistory: 'feed:btc:price:history',
+  chainlinkBtcPrice: 'feed:chainlink:btc:price',
+  chainlinkBtcPriceHistory: 'feed:chainlink:btc:price:history',
   orderbook: (marketId: string) => `feed:market:${marketId}:orderbook`,
   fairValue: (marketId: string) => `fv:${marketId}`,
   position: (marketId: string) => `position:${marketId}`,
@@ -114,6 +125,7 @@ export const REDIS_KEYS = {
 
 export const REDIS_CHANNELS = {
   btcPriceUpdated: 'btc:price:updated',
+  chainlinkBtcPriceUpdated: 'chainlink:btc:price:updated',
   orderbookUpdated: (marketId: string) => `market:orderbook:updated:${marketId}`,
   fairValueUpdated: (marketId: string) => `fv:updated:${marketId}`,
   orderFilled: (marketId: string) => `order:filled:${marketId}`,

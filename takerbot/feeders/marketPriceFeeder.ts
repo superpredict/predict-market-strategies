@@ -39,7 +39,6 @@ async function handleOrderbookUpdate(
   marketId: string,
   update: OrderbookUpdate
 ): Promise<void> {
-  // Guard: ignore stale events from a previous subscription
   if (marketId !== currentMarketId) return;
 
   const { bids, asks, timestamp } = update;
@@ -65,14 +64,24 @@ async function handleOrderbookUpdate(
     ts: timestamp,
   };
 
+  // 1. Lightweight feed (short TTL for fast access)
   await setOrderbook(feed);
 
+  // 2. Full snapshot with longer TTL for debugging
   const redis = getRedisClient();
+  const fullKey = `orderbook:full:${marketId}`;
+  await redis.set(fullKey, JSON.stringify({
+    ...feed,
+    fullBids: bids,
+    fullAsks: asks,
+  }), 'EX', 300);  // keep for 5 minutes
+
   await redis.publish(REDIS_CHANNELS.orderbookUpdated(marketId), JSON.stringify(feed));
 
   console.log(
     `[marketPriceFeeder] ${marketId.slice(0, 10)}… ` +
-    `bid=${bestBid.toFixed(3)} ask=${bestAsk.toFixed(3)} mid=${mid.toFixed(3)}`
+    `bid=${bestBid.toFixed(3)} ask=${bestAsk.toFixed(3)} ` +
+    `(depth: ${bids.length} bids, ${asks.length} asks)`
   );
 }
 

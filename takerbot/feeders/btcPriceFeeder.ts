@@ -10,16 +10,15 @@
 
 import dotenv from 'dotenv';
 import WebSocket from 'ws';
-import { BTC_MIN_PRICE_CHANGE_USD, WS_RECONNECT_DELAY_MS } from '../config/constants.js';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { appendBtcPriceHistory, setBtcPrice } from '../shared/state.js';
+import { setBtcPrice } from '../shared/state.js';
 import { REDIS_CHANNELS, type BtcPriceFeed } from '../shared/types.js';
 
 dotenv.config();
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws/btcusdt@bookTicker';
+const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws/btcusdc@bookTicker';
 const MAX_RECONNECT_ATTEMPTS = 20;
 const RECONNECT_BACKOFF_BASE = 3000; // 3 seconds
 const FORCE_RECONNECT_AFTER_MS = 23 * 60 * 60 * 1000; // 23 hours
@@ -132,7 +131,6 @@ async function handleMessage(raw: string): Promise<void> {
   const feed: BtcPriceFeed = { price, bid, ask, ts: Date.now() };
 
   await setBtcPrice(feed);
-  await appendBtcPriceHistory(price);
 
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.btcPriceUpdated, JSON.stringify(feed));

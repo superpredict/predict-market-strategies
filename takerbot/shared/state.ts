@@ -3,6 +3,7 @@ import { getRedisClient } from './redis.js';
 import type {
   ActiveMarketInfo,
   BtcPriceFeed,
+  ChainlinkBtcPriceFeed,
   FairValue,
   MarketOrderbookFeed,
   PortfolioPosition,
@@ -21,6 +22,76 @@ export async function getBtcPrice(): Promise<BtcPriceFeed | null> {
   const redis = getRedisClient();
   const raw = await redis.get(REDIS_KEYS.btcPrice);
   return raw ? (JSON.parse(raw) as BtcPriceFeed) : null;
+}
+
+// ─── Chainlink BTC Price ──────────────────────────────────────────────────────
+
+export async function setChainlinkBtcPrice(feed: ChainlinkBtcPriceFeed): Promise<void> {
+  const redis = getRedisClient();
+  await redis.set(REDIS_KEYS.chainlinkBtcPrice, JSON.stringify(feed), 'EX', FEED_TTL_SECONDS * 2);
+}
+
+export async function getChainlinkBtcPrice(): Promise<ChainlinkBtcPriceFeed | null> {
+  const redis = getRedisClient();
+  const raw = await redis.get(REDIS_KEYS.chainlinkBtcPrice);
+  return raw ? (JSON.parse(raw) as ChainlinkBtcPriceFeed) : null;
+}
+
+const WINDOW_SECONDS = 900; // 15-minute Polymarket window
+
+/**
+ * Append a Chainlink BTC price entry to the rolling history list.
+ *
+ * The Chainlink feed publishes roughly every second, so we keep 1800 entries
+ * (~30 min) to ensure the exact 15-minute boundary second is always present.
+ */
+export async function appendChainlinkPriceHistory(feed: ChainlinkBtcPriceFeed): Promise<void> {
+  const redis = getRedisClient();
+  await redis.lpush(REDIS_KEYS.chainlinkBtcPriceHistory, JSON.stringify(feed));
+  await redis.ltrim(REDIS_KEYS.chainlinkBtcPriceHistory, 0, 1799);
+  await redis.expire(REDIS_KEYS.chainlinkBtcPriceHistory, 2700); // TTL 45 min
+}
+
+/**
+ * Return the Chainlink BTC price whose chainlinkTs falls exactly on a
+ * 15-minute boundary AND matches windowTs.
+ *
+ * Polymarket's strike price is defined by the Chainlink oracle reading whose
+ * unix-second timestamp is divisible by 900 (i.e. a 15-min boundary).
+ * Because the feed publishes every second, there should be exactly one entry
+ * in history with chainlinkTs/1000 === windowTs.
+ *
+ * Returns null if no exact boundary entry is found (chainlinkPriceFeeder was
+ * not running at that second).
+ */
+export async function getChainlinkStrikeForWindow(windowTs: number): Promise<number | null> {
+  const redis = getRedisClient();
+  const rawList = await redis.lrange(REDIS_KEYS.chainlinkBtcPriceHistory, 0, -1);
+
+  if (rawList.length === 0) {
+    console.warn('[getChainlinkStrikeForWindow] ⚠️ history list is empty');
+    return null;
+  }
+
+  for (const raw of rawList) {
+    const entry = JSON.parse(raw) as ChainlinkBtcPriceFeed;
+    const entryTsSec = Math.floor(entry.chainlinkTs / 1000);
+
+    // Exact 15-min boundary: timestamp divisible by 900 AND equals the window start
+    if (entryTsSec % WINDOW_SECONDS === 0 && entryTsSec === windowTs) {
+      console.log(
+        `[getChainlinkStrikeForWindow] ✅ strike=$${entry.price} ` +
+        `(chainlinkTs=${entry.chainlinkTs} exactly at windowTs=${windowTs})`
+      );
+      return entry.price;
+    }
+  }
+
+  console.warn(
+    `[getChainlinkStrikeForWindow] ⚠️ no exact boundary entry for windowTs=${windowTs} ` +
+    `in ${rawList.length} history entries — chainlinkPriceFeeder may have been offline at that second`
+  );
+  return null;
 }
 
 // ─── Market Orderbook ─────────────────────────────────────────────────────────
@@ -94,66 +165,3 @@ export async function getActiveMarket(): Promise<ActiveMarketInfo | null> {
   return raw ? (JSON.parse(raw) as ActiveMarketInfo) : null;
 }
 
-// ─── Historical BTC Prices (momentum lookback) ────────────────────────────────
-
-interface BtcPriceEntry {
-  price: number;
-  ts: number;
-}
-
-/**
- * Append current BTC price with timestamp to a rolling list.
- * Keeps only the latest 20 entries — more than enough for a 5-min lookback.
- */
-export async function appendBtcPriceHistory(price: number): Promise<void> {
-  const redis = getRedisClient();
-  const entry: BtcPriceEntry = { price, ts: Date.now() };
-  await redis.lpush(REDIS_KEYS.btcPriceHistory, JSON.stringify(entry));
-  await redis.ltrim(REDIS_KEYS.btcPriceHistory, 0, 19);
-}
-
-export async function getBtcPriceMsAgo(
-  targetMsAgo: number = 5 * 60 * 1000
-): Promise<number | null> {
-  const redis = getRedisClient();
-  const rawList = await redis.lrange(REDIS_KEYS.btcPriceHistory, 0, -1);
-
-  if (rawList.length === 0) {
-    console.log('[getBtcPriceMsAgo] ❌ history list is completely empty');
-    return null;
-  }
-
-  console.log(`[getBtcPriceMsAgo] 📊 Found ${rawList.length} history entries`);
-
-  const targetTime = Date.now() - targetMsAgo;
-  let closestPrice: number | null = null;
-  let closestDiff = Infinity;
-
-  for (const raw of rawList) {
-    const entry = JSON.parse(raw) as BtcPriceEntry;
-    const diff = Math.abs(entry.ts - targetTime);
-    if (diff < closestDiff) {
-      closestDiff = diff;
-      closestPrice = entry.price;
-    }
-  }
-
-  console.log(`[getBtcPriceMsAgo] closestDiff: ${closestDiff}`);
-
-  const ageInSeconds = (closestDiff / 1000).toFixed(1);
-
-  // Further relaxed tolerance to ±300 seconds (5 minutes)
-  const toleranceMs = 300_000;
-
-  console.log(
-    `[getBtcPriceMsAgo] 🔍 Target: ${targetMsAgo/1000}s ago | Closest: ${ageInSeconds}s ago | Price: ${closestPrice}`
-  );
-  
-  if (closestDiff <= toleranceMs) {
-    console.log(`[getBtcPriceMsAgo] ✅ SUCCESS - Using price ${closestPrice} (${ageInSeconds}s ago)`);
-    return closestPrice;
-  } else {
-    console.log(`[getBtcPriceMsAgo] ⚠️ TOO OLD (${ageInSeconds}s > ${toleranceMs/1000}s), using fallback 0.5`);
-    return null;
-  }
-}

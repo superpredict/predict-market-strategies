@@ -46,6 +46,25 @@ module.exports = {
       env_production: prodEnv,
     },
 
+    // ── Shared: Chainlink BTC/USD price feeder (one instance) ──────────────
+    // Subscribes to Polymarket's crypto_prices_chainlink WS topic and stores
+    // the latest BTC/USD price in Redis.  fairValueUpdater reads this on each
+    // market rotation to set the Chainlink-based strike price.
+    {
+      name: 'chainlinkPriceFeeder',
+      script: TSX,
+      args: `${ROOT}/takerbot/feeders/chainlinkPriceFeeder.ts`,
+      cwd: ROOT,
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '128M',
+      restart_delay: 3000,
+      max_restarts: 20,
+      env: devEnv,
+      env_production: prodEnv,
+    },
+
     // ── Shared: Market discovery / rotation (one instance) ─────────────────
     // Polls Gamma API every 60 s; publishes to market:new-active-market on
     // each new 15-min window so all other processes hot-swap automatically.
