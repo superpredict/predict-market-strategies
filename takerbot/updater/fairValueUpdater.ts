@@ -5,10 +5,12 @@
  * updates. On each trigger it computes the fair value (probability that "Yes"
  * resolves) and publishes to fv:updated:{conditionId}.
  *
- * Model: STRIKE only.
- *   FV = clamp(0.5 + (S − K) / K × FV_SCALE, 0.05, 0.95)
+ * Model: binary-option (cash-or-nothing) with time decay.
+ *   FV = clamp( N( ln(S/K) / (σ × √T) ), 0.01, 0.99 )
  *   K = Chainlink BTC/USD price at window open (set by marketDiscovery)
  *   S = current Binance BTC mid price
+ *   T = time-to-expiry in years
+ *   σ = BTC_SIGMA_ANNUAL (annualised volatility)
  *
  * BTC staleness guard:
  *   If the BTC feed is older than BTC_STALE_FORBID_MS, trading is hard-forbidden
@@ -18,8 +20,8 @@
 
 import dotenv from 'dotenv';
 import {
+  BTC_SIGMA_ANNUAL,
   BTC_STALE_FORBID_MS,
-  FV_SCALE,
   MIN_CONFIDENCE,
   STOP_TRADING_BEFORE_EXPIRY_MS,
 } from '../config/constants.js';
@@ -49,11 +51,37 @@ let EXPIRY_TS: number | null = null;
 // ─── Fair Value Calculation ───────────────────────────────────────────────────
 
 /**
- * FV = clamp(0.5 + (S − K) / K × FV_SCALE, 0.05, 0.95)
+ * Standard-normal CDF via Abramowitz & Stegun polynomial (max error < 7.5e-8).
  */
-function computeStrikeFairValue(currentPrice: number, strikePrice: number): number {
-  const relativeDistance = (currentPrice - strikePrice) / strikePrice;
-  return Math.min(0.95, Math.max(0.05, 0.5 + relativeDistance * FV_SCALE));
+function normalCDF(x: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989423 * Math.exp(-(x * x) / 2);
+  const poly = t * (0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))));
+  const p = 1 - d * poly;
+  return x >= 0 ? p : 1 - p;
+}
+
+/**
+ * Binary-option (cash-or-nothing) fair value with time decay.
+ *
+ *   FV = clamp( N( ln(S/K) / (σ × √T) ), 0.01, 0.99 )
+ *
+ * Correctly converges to ~0 or ~1 as T → 0, matching market prices near expiry.
+ */
+function computeStrikeFairValue(
+  currentPrice: number,
+  strikePrice: number,
+  timeToExpiryMs: number
+): number {
+  const T = timeToExpiryMs / 1000 / 31_536_000; // ms → years
+  const sigmaT = BTC_SIGMA_ANNUAL * Math.sqrt(T);
+
+  if (sigmaT < 1e-9) {
+    return currentPrice >= strikePrice ? 0.99 : 0.01;
+  }
+
+  const d = Math.log(currentPrice / strikePrice) / sigmaT;
+  return Math.min(0.99, Math.max(0.01, normalCDF(d)));
 }
 
 /**
@@ -98,7 +126,7 @@ async function computeAndPublish(
 
   if (timeToExpiryMs < STOP_TRADING_BEFORE_EXPIRY_MS) return;
 
-  const value = computeStrikeFairValue(btcFeed.price, STRIKE_PRICE);
+  const value = computeStrikeFairValue(btcFeed.price, STRIKE_PRICE, timeToExpiryMs);
   const confidence = computeConfidence(obFeed.ts, timeToExpiryMs);
 
   if (confidence < MIN_CONFIDENCE) {

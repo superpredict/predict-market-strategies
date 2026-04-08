@@ -19,17 +19,17 @@ export const MAX_EXPOSURE_USDC = 200;
 // ─── Fair Value Model ─────────────────────────────────────────────────────────
 
 /**
- * Linear scale factor for the simplified FV model.
+ * Annualised BTC volatility used in the binary-option FV model.
  *
- *   FV = clamp(0.5 + (S - K) / K × FV_SCALE, 0.05, 0.95)
+ *   FV = clamp( N( ln(S/K) / (σ × √T) ), 0.01, 0.99 )
  *
- * Examples (FV_SCALE = 5):
- *   BTC 2% above strike  →  FV = 0.5 + 0.02 × 5 = 0.60
- *   BTC 5% above strike  →  FV = 0.5 + 0.05 × 5 = 0.75
- *   BTC 2% below strike  →  FV = 0.5 - 0.02 × 5 = 0.40
- *   BTC 10%+ above strike → clamped to 0.95
+ * where T is time-to-expiry in years and N is the standard-normal CDF.
+ * The model naturally converges to 0 or 1 as T → 0, matching the market.
+ *
+ * Calibrated from live order-book data (15-min BTC windows, April 2026):
+ *   σ = 30 % annualised → N(1.42) ≈ 0.922 at tte=278 s, +0.13 % above strike
  */
-export const FV_SCALE = 5;
+export const BTC_SIGMA_ANNUAL = 0.30;
 
 /** Minimum model confidence (0–1) required to trade. */
 export const MIN_CONFIDENCE = 0.18;
