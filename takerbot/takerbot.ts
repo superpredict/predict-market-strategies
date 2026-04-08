@@ -52,7 +52,7 @@ async function startStrategy(info: ActiveMarketInfo): Promise<void> {
 
   console.log(`[takerbot] market   : ${config.marketId}`);
   console.log(`[takerbot] expiry   : ${config.expiryTime.toISOString()}`);
-  console.log(`[takerbot] strike   : ${config.strikePrice ?? 'N/A (up/down momentum)'}`);
+  console.log(`[takerbot] strike   : ${config.strikePrice ?? 'N/A'}`);
   console.log(`[takerbot] dryRun   : ${config.dryRun}`);
   console.log(`[takerbot] size     : $${config.positionSizeUsdc} USDC per trade`);
   console.log(`[takerbot] edge     : ${(config.edgeThreshold * 100).toFixed(1)}% required`);

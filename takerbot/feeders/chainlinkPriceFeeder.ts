@@ -16,7 +16,7 @@
 import dotenv from 'dotenv';
 import WebSocket from 'ws';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { appendChainlinkPriceHistory, setChainlinkBtcPrice } from '../shared/state.js';
+import { appendChainlinkPriceHistory, getBtcPrice, setChainlinkBtcPrice } from '../shared/state.js';
 import { REDIS_CHANNELS, type ChainlinkBtcPriceFeed } from '../shared/types.js';
 
 dotenv.config();
@@ -148,10 +148,21 @@ async function handleMessage(raw: string): Promise<void> {
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.chainlinkBtcPriceUpdated, JSON.stringify(feed));
 
+  // Fetch the latest Binance snapshot and check whether it belongs to the same second
+  const btcFeed = await getBtcPrice();
+  let binanceTag = ' | Binance N/A';
+  if (btcFeed) {
+    const sameSec = Math.floor(btcFeed.ts / 1000) === chainlinkTsSec;
+    const marker = sameSec ? ' ✓' : ` (Δ${chainlinkTsSec - Math.floor(btcFeed.ts / 1000)}s)`;
+    binanceTag =
+      ` | Binance $${btcFeed.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` +
+      ` (ws_ms: ${Math.floor(btcFeed.ts / 1000) * 1000})${marker}`;
+  }
+
   const boundaryTag = isBoundary ? ' ★ 15-MIN BOUNDARY (STRIKE PRICE)' : '';
   console.log(
     `[chainlinkPriceFeeder] Chainlink BTC/USD $${price.toLocaleString()} ` +
-    `(chainlink ts: ${msg.payload.timestamp})${boundaryTag}`
+    `(chainlink ts: ${chainlinkTs})${binanceTag}${boundaryTag}`
   );
 }
 

@@ -1,17 +1,23 @@
 /**
- * btcPriceFeeder (Improved Version)
+ * btcPriceFeeder
  *
- * Fixed issues:
- * - Proper ping/pong handling to prevent Binance from closing the connection
- * - Exponential backoff reconnection
- * - 24-hour forced reconnect
- * - More stable price updates
+ * Streams Binance BTCUSDC best bid/ask via bookTicker WebSocket and publishes
+ * one snapshot per second to Redis — mirroring the Chainlink feeder's cadence.
+ *
+ * Binance fires bookTicker on every tick (many times per second).  We buffer
+ * the latest bid/ask and only publish when the Unix second advances, so the
+ * log and Redis updates are clean 1-per-second entries with no duplicates.
+ *
+ * Redis:
+ *   SET  feed:btc:price                { price, bid, ask, ts }
+ *   SET  feed:btc:ws:last-received-sec <unix_sec>              (liveness probe)
+ *   PUB  btc:price:updated
  */
 
 import dotenv from 'dotenv';
 import WebSocket from 'ws';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { setBtcPrice } from '../shared/state.js';
+import { setBtcPrice, setBtcWsLastReceivedSec } from '../shared/state.js';
 import { REDIS_CHANNELS, type BtcPriceFeed } from '../shared/types.js';
 
 dotenv.config();
@@ -20,16 +26,22 @@ dotenv.config();
 
 const BINANCE_WS_URL = 'wss://stream.binance.com:9443/ws/btcusdc@bookTicker';
 const MAX_RECONNECT_ATTEMPTS = 20;
-const RECONNECT_BACKOFF_BASE = 3000; // 3 seconds
+const RECONNECT_BACKOFF_BASE = 3000;
+const MAX_RECONNECT_BACKOFF = 60_000;
 const FORCE_RECONNECT_AFTER_MS = 23 * 60 * 60 * 1000; // 23 hours
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-let lastPublishedPrice = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let ws: WebSocket | null = null;
 let reconnectAttempts = 0;
 let lastConnectTime = 0;
+
+/** Unix second of the last published snapshot — throttle to 1 publish/sec. */
+let lastPublishedSec = 0;
+/** Latest bid/ask buffered from incoming ticks within the current second. */
+let pendingBid = 0;
+let pendingAsk = 0;
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 
@@ -50,20 +62,12 @@ function connect(): void {
     reconnectAttempts = 0;
   });
 
-  // Handle Binance ping (critical for stability)
   ws.on('ping', (data) => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.pong(data); // Reply with the same payload
-      console.log('[btcPriceFeeder] received ping, sent pong');
-    }
+    ws?.pong(data);
   });
 
-  ws.on('message', async (raw) => {
-    try {
-      await handleMessage(raw.toString());
-    } catch (err) {
-      console.error('[btcPriceFeeder] message error:', err);
-    }
+  ws.on('message', (raw) => {
+    void handleMessage(raw.toString());
   });
 
   ws.on('error', (err) => {
@@ -79,10 +83,8 @@ function connect(): void {
 function scheduleReconnect(): void {
   if (reconnectTimer) return;
 
-  // Exponential backoff: 3s → 6s → 12s → max ~60s
-  const backoff = Math.min(RECONNECT_BACKOFF_BASE * Math.pow(2, reconnectAttempts), 60000);
-
-  console.log(`[btcPriceFeeder] scheduling reconnect in ${backoff / 1000}s (attempt ${reconnectAttempts + 1})`);
+  const backoff = Math.min(RECONNECT_BACKOFF_BASE * Math.pow(2, reconnectAttempts), MAX_RECONNECT_BACKOFF);
+  console.log(`[btcPriceFeeder] reconnecting in ${backoff / 1000}s (attempt ${reconnectAttempts + 1})`);
 
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
@@ -95,47 +97,62 @@ function scheduleReconnect(): void {
   }, backoff);
 }
 
-// Force reconnect every ~23 hours to handle Binance 24h limit
+// Force reconnect every 30 min to guard against Binance's 24 h connection limit
 setInterval(() => {
   if (ws && Date.now() - lastConnectTime > FORCE_RECONNECT_AFTER_MS) {
     console.log('[btcPriceFeeder] forcing reconnect due to 24h limit');
-    if (ws) ws.close();
+    ws.close();
   }
-}, 30 * 60 * 1000); // Check every 30 minutes
+}, 30 * 60 * 1000);
 
 // ─── Message Handler ──────────────────────────────────────────────────────────
 
 interface BinanceBookTicker {
   u: number;
   s: string;
-  b: string;
-  B: string;
-  a: string;
-  A: string;
+  b: string; // best bid price
+  B: string; // best bid qty
+  a: string; // best ask price
+  A: string; // best ask qty
 }
 
 async function handleMessage(raw: string): Promise<void> {
-  const msg = JSON.parse(raw) as BinanceBookTicker;
+  const currentSec = Math.floor(Date.now() / 1000);
+
+  // Liveness probe — stamp every frame so the TTL key never goes stale mid-second
+  await setBtcWsLastReceivedSec(currentSec);
+
+  let msg: BinanceBookTicker;
+  try {
+    msg = JSON.parse(raw) as BinanceBookTicker;
+  } catch {
+    return;
+  }
 
   const bid = Number.parseFloat(msg.b);
   const ask = Number.parseFloat(msg.a);
   if (isNaN(bid) || isNaN(ask) || bid <= 0 || ask <= 0) return;
 
-  const price = (bid + ask) / 2;
+  // Always buffer the latest tick within this second
+  pendingBid = bid;
+  pendingAsk = ask;
 
-  // Temporarily lowered threshold for better responsiveness during testing
-  if (Math.abs(price - lastPublishedPrice) < 2) return; // changed from BTC_MIN_PRICE_CHANGE_USD
+  // Publish at most once per second — same cadence as chainlinkPriceFeeder
+  if (currentSec <= lastPublishedSec) return;
+  lastPublishedSec = currentSec;
 
-  lastPublishedPrice = price;
-
-  const feed: BtcPriceFeed = { price, bid, ask, ts: Date.now() };
+  const price = (pendingBid + pendingAsk) / 2;
+  const feed: BtcPriceFeed = { price, bid: pendingBid, ask: pendingAsk, ts: Date.now() };
 
   await setBtcPrice(feed);
 
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.btcPriceUpdated, JSON.stringify(feed));
 
-  console.log(`[btcPriceFeeder] BTC $${price.toFixed(2)}  bid=${bid.toFixed(2)} ask=${ask.toFixed(2)}`);
+  console.log(
+    `[btcPriceFeeder] BTC/USD $${price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ` +
+    `bid=${pendingBid.toFixed(2)} ask=${pendingAsk.toFixed(2)} (ws_ms: ${Math.floor(feed.ts / 1000) * 1000})`
+  );
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────

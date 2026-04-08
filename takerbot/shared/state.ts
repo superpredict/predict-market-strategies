@@ -24,6 +24,18 @@ export async function getBtcPrice(): Promise<BtcPriceFeed | null> {
   return raw ? (JSON.parse(raw) as BtcPriceFeed) : null;
 }
 
+/** Stamp the Unix second at which the last Binance WS frame was received. TTL = 60 s. */
+export async function setBtcWsLastReceivedSec(tsSec: number): Promise<void> {
+  const redis = getRedisClient();
+  await redis.set(REDIS_KEYS.btcWsLastReceivedSec, String(tsSec), 'EX', 60);
+}
+
+export async function getBtcWsLastReceivedSec(): Promise<number | null> {
+  const redis = getRedisClient();
+  const raw = await redis.get(REDIS_KEYS.btcWsLastReceivedSec);
+  return raw ? Number(raw) : null;
+}
+
 // ─── Chainlink BTC Price ──────────────────────────────────────────────────────
 
 export async function setChainlinkBtcPrice(feed: ChainlinkBtcPriceFeed): Promise<void> {

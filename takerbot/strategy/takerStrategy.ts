@@ -197,7 +197,12 @@ private async evaluate(fv: FairValue): Promise<void> {
     this.lastProcessedFvPublishedAt = fv.publishedAt;
     this.lastProcessedFvTs = now;
 
-    console.log(`[latency] Total FV → Order: ${totalLatencyMs}ms | FV=${(fv.value*100).toFixed(2)}% conf=${(fv.confidence*100).toFixed(1)}%`);
+    const strikeStr = fv.strikePrice != null ? `$${fv.strikePrice.toFixed(2)}` : 'N/A';
+    console.log(
+      `[latency] Total FV → Order: ${totalLatencyMs}ms | ` +
+      `FV=${(fv.value * 100).toFixed(2)}% conf=${(fv.confidence * 100).toFixed(1)}% | ` +
+      `BTC=$${fv.btcPrice.toFixed(2)} strike=${strikeStr}`
+    );
 
     // Fix #1: stale FV — log and bail out; never trade on a price that is >50 ms old.
     if (totalLatencyMs > 50) {
