@@ -84,15 +84,24 @@ function computeStrikeFairValue(
   return Math.min(0.99, Math.max(0.01, normalCDF(d)));
 }
 
+interface ConfidenceResult {
+  confidence: number;
+  obStaleness: number;
+  timeBonus: number;
+  atFloor: boolean;
+}
+
 /**
  * Confidence score based on orderbook freshness and time-to-expiry.
  * BTC staleness is handled upstream via a hard forbid, not here.
  */
-function computeConfidence(obTs: number, timeToExpiryMs: number): number {
+function computeConfidence(obTs: number, timeToExpiryMs: number): ConfidenceResult {
   const now = Date.now();
   const obStaleness = Math.max(0, 1 - (now - obTs) / 20_000); // 20 s window
-  const timeBonus = Math.min(1, timeToExpiryMs / 2_400_000);
-  return Math.max(0.18, obStaleness * timeBonus);
+  const timeBonus = Math.min(1, timeToExpiryMs / 1_000_000); // floor at MIN_CONFIDENCE when tte ≈ 3 min
+  const rawScore = obStaleness * timeBonus;
+  const confidence = Math.max(MIN_CONFIDENCE, rawScore);
+  return { confidence, obStaleness, timeBonus, atFloor: rawScore < MIN_CONFIDENCE };
 }
 
 // ─── Core Computation ────────────────────────────────────────────────────────
@@ -127,7 +136,7 @@ async function computeAndPublish(
   if (timeToExpiryMs < STOP_TRADING_BEFORE_EXPIRY_MS) return;
 
   const value = computeStrikeFairValue(btcFeed.price, STRIKE_PRICE, timeToExpiryMs);
-  const confidence = computeConfidence(obFeed.ts, timeToExpiryMs);
+  const { confidence, obStaleness, timeBonus, atFloor } = computeConfidence(obFeed.ts, timeToExpiryMs);
 
   if (confidence < MIN_CONFIDENCE) {
     const obStaleSec = ((now - obFeed.ts) / 1000).toFixed(1);
@@ -137,6 +146,20 @@ async function computeAndPublish(
       `(obStale:${obStaleSec}s, tte:${tteSec}s) — skipping`
     );
     return;
+  }
+
+  if (atFloor) {
+    const reasons: string[] = [];
+    if (obStaleness < 0.5) {
+      const obAgeSec = ((now - obFeed.ts) / 1000).toFixed(1);
+      reasons.push(`ob stale (age=${obAgeSec}s, staleness=${(obStaleness * 100).toFixed(0)}%)`);
+    }
+    if (timeBonus < 0.5) {
+      const tteSec = Math.round(timeToExpiryMs / 1000);
+      reasons.push(`low tte (${tteSec}s, bonus=${(timeBonus * 100).toFixed(0)}%)`);
+    }
+    if (reasons.length === 0) reasons.push(`combined score too low (ob=${(obStaleness * 100).toFixed(0)}%, tte=${(timeBonus * 100).toFixed(0)}%)`);
+    console.log(`[fairValueUpdater] conf=MIN_CONFIDENCE(${MIN_CONFIDENCE}) — ${reasons.join(' | ')}`);
   }
 
   const fv: FairValue = {
