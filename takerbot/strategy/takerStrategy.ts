@@ -46,6 +46,8 @@ export class TakerStrategy extends Strategy {
   private marketConfig: MarketConfig;
   private isProcessing = false;
   private lastProcessedFvTs = 0;
+  /** Tracks the publishedAt of the last FV we actually evaluated, to deduplicate slow-tick re-processing. */
+  private lastProcessedFvPublishedAt = 0;
 
   private latencyStats: number[] = [];
 
@@ -120,6 +122,7 @@ export class TakerStrategy extends Strategy {
     // Reset per-market state so the first evaluate() on the new market starts clean
     this.isProcessing = false;
     this.lastProcessedFvTs = 0;
+    this.lastProcessedFvPublishedAt = 0;
     this.latencyStats = [];
 
     // Re-subscribe the fair-value channel for the new market
@@ -173,23 +176,33 @@ private async evaluate(fv: FairValue): Promise<void> {
     const fvReceivedAt = Date.now();
     const totalLatencyMs = fvReceivedAt - fv.publishedAt;
 
+    // Fix #3: deduplicate — skip if this exact FV (same publishedAt) was already evaluated.
+    // This prevents the 10-s slow-tick from re-processing a stale FV that the fast path
+    // already handled, which was the root cause of duplicate order signals on SLOW ticks.
+    if (fv.publishedAt <= this.lastProcessedFvPublishedAt) {
+      return;
+    }
+
+    // Debounce: drop rapid-fire burst (multiple distinct FVs arriving within 50 ms)
     const now = Date.now();
     const timeSinceLast = now - this.lastProcessedFvTs;
-
-    // Skip if FV updates come too frequently (debounce)
     if (timeSinceLast < 50) {
-      if (Math.random() < 0.08) {   
+      if (Math.random() < 0.08) {
         console.log(`[takerStrategy] ⏭️ skipped FV (too frequent: ${timeSinceLast}ms ago)`);
       }
       return;
     }
 
+    // Stamp both trackers before any early-return so re-delivery of this FV is always blocked
+    this.lastProcessedFvPublishedAt = fv.publishedAt;
     this.lastProcessedFvTs = now;
 
     console.log(`[latency] Total FV → Order: ${totalLatencyMs}ms | FV=${(fv.value*100).toFixed(2)}% conf=${(fv.confidence*100).toFixed(1)}%`);
 
+    // Fix #1: stale FV — log and bail out; never trade on a price that is >50 ms old.
     if (totalLatencyMs > 50) {
-      console.warn(`[latency] ⚠️ SLOW: ${totalLatencyMs}ms (target < 50ms)`);
+      console.warn(`[latency] ⚠️ SLOW: ${totalLatencyMs}ms (target < 50ms) — skipping stale FV`);
+      return;
     }
 
     // Safety checks
@@ -238,7 +251,9 @@ private async evaluate(fv: FairValue): Promise<void> {
       return false;
     }
   
-    if (confidence < MIN_CONFIDENCE) {
+    // Fix #2: treat confidence == MIN_CONFIDENCE as "floor hit" (orderbook is stale),
+    // not as a valid trading signal. Only trade when there is genuine confidence above the floor.
+    if (confidence <= MIN_CONFIDENCE) {
       console.log(`[takerStrategy] low confidence (${(confidence * 100).toFixed(1)}%) — skipping`);
       return false;
     }

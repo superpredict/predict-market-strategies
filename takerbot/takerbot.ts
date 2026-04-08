@@ -88,34 +88,21 @@ async function main(): Promise<void> {
 
   exchange = new Polymarket({ privateKey, verbose: VERBOSE });
 
-  console.log('[takerbot] Clearing previous active market on startup...');
-  const redis = getRedisClient();
-  await redis.del('market:active-btc15m');   // make sure the key name is correct
-  
-  // Try cold-start: load active market already stored by marketDiscovery
-  const existing = await getActiveMarket();
-  if (existing) {
-    console.log('[takerbot] found active market in Redis, starting strategy…');
-    await startStrategy(existing);
-    return;
-  }
-
-  // No market yet — subscribe once for the very first discovery event,
-  // then the strategy owns all future rotations.
-  console.log('[takerbot] no active market in Redis yet — waiting for marketDiscovery…');
-
+  // Subscribe FIRST to avoid a race condition where marketDiscovery publishes
+  // between our Redis read and our subscribe call.
   const sub = getSubscriberClient();
   await sub.subscribe(REDIS_CHANNELS.newActiveMarket);
 
+  let resolved = false;
+
   const initialHandler = (channel: string, message: string) => {
-    if (channel !== REDIS_CHANNELS.newActiveMarket) return;
-    // Remove this one-shot handler before doing async work to avoid re-entry
+    if (channel !== REDIS_CHANNELS.newActiveMarket || resolved) return;
+    resolved = true;
     sub.off('message', initialHandler);
     void (async () => {
       try {
         const info = JSON.parse(message) as ActiveMarketInfo;
         await startStrategy(info);
-        // strategy now handles all subsequent rotations
       } catch (err) {
         console.error('[takerbot] failed to start strategy on first market event:', err);
       }
@@ -123,6 +110,24 @@ async function main(): Promise<void> {
   };
 
   sub.on('message', initialHandler);
+
+  // Poll Redis every 5 s until a still-valid market appears (handles the case
+  // where the Redis key already exists but we started before the pub/sub fired,
+  // or where the key was absent because its TTL expired between windows).
+  const POLL_INTERVAL_MS = 5_000;
+  console.log('[takerbot] checking Redis for active market…');
+  while (!resolved) {
+    const existing = await getActiveMarket();
+    if (existing && existing.expiryTs > Date.now()) {
+      resolved = true;
+      sub.off('message', initialHandler);
+      console.log(`[takerbot] found active market in Redis: "${existing.question}"`);
+      await startStrategy(existing);
+      return;
+    }
+    console.log('[takerbot] no valid active market in Redis yet — waiting for marketDiscovery…');
+    await new Promise<void>((r) => setTimeout(r, POLL_INTERVAL_MS));
+  }
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────
