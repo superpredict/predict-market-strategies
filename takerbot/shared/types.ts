@@ -119,6 +119,12 @@ export const REDIS_KEYS = {
   chainlinkBtcPrice: 'feed:chainlink:btc:price',
   chainlinkBtcPriceHistory: 'feed:chainlink:btc:price:history',
   orderbook: (marketId: string) => `feed:market:${marketId}:orderbook`,
+  /**
+   * Depth-pressure signal for a market.
+   * Values: 1 = bid depth surged, -1 = ask depth surged, 0 = neutral.
+   * Published by marketPriceFeeder; auto-expires after DEPTH_PRESSURE_TTL_SEC.
+   */
+  depthPressure: (marketId: string) => `feed:market:${marketId}:depth-pressure`,
   fairValue: (marketId: string) => `fv:${marketId}`,
   position: (marketId: string) => `position:${marketId}`,
   portfolio: 'portfolio:snapshot',
@@ -129,6 +135,8 @@ export const REDIS_CHANNELS = {
   btcPriceUpdated: 'btc:price:updated',
   chainlinkBtcPriceUpdated: 'chainlink:btc:price:updated',
   orderbookUpdated: (marketId: string) => `market:orderbook:updated:${marketId}`,
+  /** Published whenever the depth-pressure signal changes (including reset to 0). */
+  depthPressureUpdated: (marketId: string) => `market:depth-pressure:updated:${marketId}`,
   fairValueUpdated: (marketId: string) => `fv:updated:${marketId}`,
   orderFilled: (marketId: string) => `order:filled:${marketId}`,
   newActiveMarket: 'market:new-active-market',

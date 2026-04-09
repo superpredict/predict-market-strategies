@@ -9,7 +9,7 @@ import type {
   PortfolioPosition,
   PortfolioSnapshot,
 } from './types.js';
-import { REDIS_KEYS } from './types.js';
+import { REDIS_CHANNELS, REDIS_KEYS } from './types.js';
 
 // ─── BTC Price ────────────────────────────────────────────────────────────────
 
@@ -107,6 +107,47 @@ export async function getChainlinkStrikeForWindow(windowTs: number): Promise<num
 }
 
 // ─── Market Orderbook ─────────────────────────────────────────────────────────
+
+/**
+ * Depth-pressure signal payload published to depthPressureUpdated channel.
+ * signal: 1 = bid depth surged, -1 = ask depth surged, 0 = reset to neutral.
+ */
+export interface DepthPressurePayload {
+  marketId: string;
+  signal: number;
+  ts: number;
+}
+
+/** TTL (seconds) for the depth-pressure Redis key. */
+const DEPTH_PRESSURE_TTL_SEC = 120;
+
+/**
+ * Write the depth-pressure signal for a market.
+ * Also publishes to the depthPressureUpdated channel so subscribers are notified immediately.
+ */
+export async function setDepthPressure(
+  redis: import('ioredis').Redis,
+  marketId: string,
+  signal: number,
+): Promise<void> {
+  await redis.set(
+    REDIS_KEYS.depthPressure(marketId),
+    String(signal),
+    'EX',
+    DEPTH_PRESSURE_TTL_SEC,
+  );
+  await redis.publish(
+    REDIS_CHANNELS.depthPressureUpdated(marketId),
+    JSON.stringify({ marketId, signal, ts: Date.now() } satisfies DepthPressurePayload),
+  );
+}
+
+/** Read the current depth-pressure signal (0 if key is absent / expired). */
+export async function getDepthPressure(marketId: string): Promise<number> {
+  const redis = getRedisClient();
+  const raw = await redis.get(REDIS_KEYS.depthPressure(marketId));
+  return raw !== null ? Number(raw) : 0;
+}
 
 export async function setOrderbook(feed: MarketOrderbookFeed): Promise<void> {
   const redis = getRedisClient();

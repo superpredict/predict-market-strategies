@@ -19,7 +19,7 @@ import dotenv from 'dotenv';
 import { PolymarketWebSocket } from '@superpredict/ccxt';
 import type { OrderbookUpdate } from '@superpredict/ccxt';
 import { closeRedis, getRedisClient, getSubscriberClient } from '../shared/redis.js';
-import { getActiveMarket, setOrderbook } from '../shared/state.js';
+import { getActiveMarket, setDepthPressure, setOrderbook } from '../shared/state.js';
 import { REDIS_CHANNELS, type ActiveMarketInfo, type MarketOrderbookFeed } from '../shared/types.js';
 
 dotenv.config();
@@ -32,6 +32,139 @@ let currentMarketId: string | null = null;
 let currentYesTokenId: string | null = null;
 let lastBestBid = -1;
 let lastBestAsk = -1;
+
+// ─── Depth-surge detection ────────────────────────────────────────────────────
+
+/**
+ * Rolling window used to detect sudden depth spikes.
+ * Each sample records the number of bid and ask levels at a point in time.
+ */
+interface DepthSample {
+  ts: number;
+  bidDepth: number;
+  askDepth: number;
+}
+
+/**
+ * Look-back window for surge detection.
+ * A "surge" is triggered when depth increases meaningfully within this period.
+ */
+const SURGE_WINDOW_MS = 30_000;
+
+/**
+ * A depth side is considered "surging" when BOTH conditions hold within
+ * SURGE_WINDOW_MS:
+ *   - absolute increase ≥ SURGE_ABS_THRESHOLD levels
+ *   - relative increase ≥ SURGE_PCT_THRESHOLD  (e.g. 0.25 = 25 %)
+ */
+const SURGE_ABS_THRESHOLD = 5;
+const SURGE_PCT_THRESHOLD = 0.25;
+
+/**
+ * How long after the last detected surge before the signal auto-resets to 0.
+ * Also used as the Redis key TTL buffer.
+ */
+const SURGE_RESET_MS = 30_000;
+
+const depthHistory: DepthSample[] = [];
+let currentPressure = 0;
+let pressureResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Push a new depth sample, prune stale entries, and return the signal:
+ *   1  = bid-side depth surged
+ *  -1  = ask-side depth surged
+ *   0  = no significant change
+ *
+ * When both sides surge simultaneously the side with the larger relative
+ * increase wins; if equal, returns 0 (ambiguous).
+ */
+function evaluateDepthSurge(bidDepth: number, askDepth: number): number {
+  const now = Date.now();
+  depthHistory.push({ ts: now, bidDepth, askDepth });
+
+  // Prune anything older than 2 × window (keep headroom for comparison)
+  const cutoff = now - SURGE_WINDOW_MS * 2;
+  while (depthHistory.length > 1 && depthHistory[0]!.ts < cutoff) {
+    depthHistory.shift();
+  }
+
+  // Find the oldest sample that is still inside the detection window
+  const windowStart = now - SURGE_WINDOW_MS;
+  const baseline = depthHistory.find(s => s.ts >= windowStart);
+  if (!baseline || baseline === depthHistory[depthHistory.length - 1]) return 0;
+
+  const bidInc = bidDepth - baseline.bidDepth;
+  const askInc = askDepth - baseline.askDepth;
+
+  const bidPct = baseline.bidDepth > 0 ? bidInc / baseline.bidDepth : 0;
+  const askPct = baseline.askDepth > 0 ? askInc / baseline.askDepth : 0;
+
+  const bidSurge = bidInc >= SURGE_ABS_THRESHOLD && bidPct >= SURGE_PCT_THRESHOLD;
+  const askSurge = askInc >= SURGE_ABS_THRESHOLD && askPct >= SURGE_PCT_THRESHOLD;
+
+  if (bidSurge && !askSurge) return 1;
+  if (askSurge && !bidSurge) return -1;
+  if (bidSurge && askSurge) return bidPct > askPct ? 1 : askPct > bidPct ? -1 : 0;
+  return 0;
+}
+
+/** Reset depth-surge state when switching to a new market. */
+function resetDepthState(): void {
+  depthHistory.length = 0;
+  currentPressure = 0;
+  if (pressureResetTimer !== null) {
+    clearTimeout(pressureResetTimer);
+    pressureResetTimer = null;
+  }
+}
+
+/**
+ * Evaluate and, if necessary, write the depth-pressure signal to Redis.
+ * Schedules an auto-reset after SURGE_RESET_MS when a non-zero signal fires.
+ */
+async function updateDepthPressure(marketId: string, bidDepth: number, askDepth: number): Promise<void> {
+  const signal = evaluateDepthSurge(bidDepth, askDepth);
+  const redis = getRedisClient();
+
+  if (signal !== 0) {
+    // Cancel any pending reset so the signal stays live while surges continue
+    if (pressureResetTimer !== null) {
+      clearTimeout(pressureResetTimer);
+      pressureResetTimer = null;
+    }
+
+    if (signal !== currentPressure) {
+      currentPressure = signal;
+      await setDepthPressure(redis, marketId, signal);
+      console.log(
+        `[marketPriceFeeder] depth-pressure → ${signal > 0 ? '+1 (bid surge)' : '-1 (ask surge)'} ` +
+        `market=${marketId.slice(0, 10)}… ` +
+        `bids=${bidDepth} asks=${askDepth}`
+      );
+    }
+
+    // Schedule auto-reset
+    pressureResetTimer = setTimeout(() => {
+      pressureResetTimer = null;
+      if (currentMarketId === null) return;
+      currentPressure = 0;
+      void setDepthPressure(redis, currentMarketId, 0).then(() => {
+        console.log(
+          `[marketPriceFeeder] depth-pressure → 0 (auto-reset) market=${currentMarketId!.slice(0, 10)}…`
+        );
+      });
+    }, SURGE_RESET_MS);
+
+  } else if (currentPressure !== 0 && pressureResetTimer === null) {
+    // Surge dissipated naturally with no pending timer → reset immediately
+    currentPressure = 0;
+    await setDepthPressure(redis, marketId, 0);
+    console.log(
+      `[marketPriceFeeder] depth-pressure → 0 (natural reset) market=${marketId.slice(0, 10)}…`
+    );
+  }
+}
 
 // ─── Orderbook handler ────────────────────────────────────────────────────────
 
@@ -78,6 +211,9 @@ async function handleOrderbookUpdate(
 
   await redis.publish(REDIS_CHANNELS.orderbookUpdated(marketId), JSON.stringify(feed));
 
+  // 3. Depth-surge detection
+  await updateDepthPressure(marketId, bids.length, asks.length);
+
   console.log(
     `[marketPriceFeeder] ${marketId.slice(0, 10)}… ` +
     `bid=${bestBid.toFixed(3)} ask=${bestAsk.toFixed(3)} ` +
@@ -102,6 +238,7 @@ async function switchToMarket(info: ActiveMarketInfo): Promise<void> {
   currentYesTokenId = info.yesTokenId;
   lastBestBid = -1;
   lastBestAsk = -1;
+  resetDepthState();
 
   // Disconnect current WS session and reconnect with the new token.
   // PolymarketWebSocket.autoReconnect handles the low-level reconnection;
@@ -161,6 +298,7 @@ async function start(): Promise<void> {
 
 async function shutdown(): Promise<void> {
   console.log('[marketPriceFeeder] shutting down…');
+  resetDepthState();
   await polyWs.disconnect();
   await closeRedis();
   process.exit(0);
