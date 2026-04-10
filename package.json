@@ -9,6 +9,8 @@
     "start": "node dist/index.js",
     "takerbot": "tsx takerbot/takerbot.ts",
     "takerbot:btcFeeder": "tsx takerbot/feeders/btcPriceFeeder.ts",
+    "takerbot:chainlinkFeeder": "tsx takerbot/feeders/chainlinkPriceFeeder.ts",
+    "takerbot:priceReport": "tsx takerbot/tools/priceFeedPairReport.ts",
     "takerbot:marketFeeder": "tsx takerbot/feeders/marketPriceFeeder.ts",
     "takerbot:fvUpdater": "tsx takerbot/updater/fairValueUpdater.ts",
     "takerbot:portfolio": "tsx takerbot/portfolio/portfolioTracker.ts",

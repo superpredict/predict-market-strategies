@@ -114,6 +114,8 @@ export interface MarketConfig {
 
 export const REDIS_KEYS = {
   btcPrice: 'feed:btc:price',
+  /** Rolling list of recent Binance mid snapshots (JSON strings), same window as chainlink history */
+  btcPriceHistory: 'feed:btc:price:history',
   /** Unix seconds of the last raw WS frame received from Binance */
   btcWsLastReceivedSec: 'feed:btc:ws:last-received-sec',
   chainlinkBtcPrice: 'feed:chainlink:btc:price',

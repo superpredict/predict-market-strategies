@@ -18,6 +18,29 @@ export async function setBtcPrice(feed: BtcPriceFeed): Promise<void> {
   await redis.set(REDIS_KEYS.btcPrice, JSON.stringify(feed), 'EX', FEED_TTL_SECONDS);
 }
 
+/**
+ * Append a Binance BTC mid snapshot to the rolling history list (for Redis-backed diff reports).
+ * Same length/TTL policy as Chainlink history so seconds align for pairing.
+ */
+export async function appendBtcPriceHistory(feed: BtcPriceFeed): Promise<void> {
+  const redis = getRedisClient();
+  await redis.lpush(REDIS_KEYS.btcPriceHistory, JSON.stringify(feed));
+  await redis.ltrim(REDIS_KEYS.btcPriceHistory, 0, 1799);
+  await redis.expire(REDIS_KEYS.btcPriceHistory, 2700);
+}
+
+export async function getBtcPriceHistory(): Promise<BtcPriceFeed[]> {
+  const redis = getRedisClient();
+  const rawList = await redis.lrange(REDIS_KEYS.btcPriceHistory, 0, -1);
+  return rawList.map((raw) => JSON.parse(raw) as BtcPriceFeed);
+}
+
+export async function getChainlinkBtcPriceHistory(): Promise<ChainlinkBtcPriceFeed[]> {
+  const redis = getRedisClient();
+  const rawList = await redis.lrange(REDIS_KEYS.chainlinkBtcPriceHistory, 0, -1);
+  return rawList.map((raw) => JSON.parse(raw) as ChainlinkBtcPriceFeed);
+}
+
 export async function getBtcPrice(): Promise<BtcPriceFeed | null> {
   const redis = getRedisClient();
   const raw = await redis.get(REDIS_KEYS.btcPrice);

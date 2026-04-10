@@ -10,6 +10,7 @@
  *
  * Redis:
  *   SET  feed:btc:price                { price, bid, ask, ts }
+ *   LIST feed:btc:price:history        rolling ~30m of snapshots (for pair stats)
  *   SET  feed:btc:ws:last-received-sec <unix_sec>              (liveness probe)
  *   PUB  btc:price:updated
  */
@@ -17,7 +18,7 @@
 import dotenv from 'dotenv';
 import WebSocket from 'ws';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { setBtcPrice, setBtcWsLastReceivedSec } from '../shared/state.js';
+import { appendBtcPriceHistory, setBtcPrice, setBtcWsLastReceivedSec } from '../shared/state.js';
 import { REDIS_CHANNELS, type BtcPriceFeed } from '../shared/types.js';
 
 dotenv.config();
@@ -145,6 +146,7 @@ async function handleMessage(raw: string): Promise<void> {
   const feed: BtcPriceFeed = { price, bid: pendingBid, ask: pendingAsk, ts: Date.now() };
 
   await setBtcPrice(feed);
+  await appendBtcPriceHistory(feed);
 
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.btcPriceUpdated, JSON.stringify(feed));
