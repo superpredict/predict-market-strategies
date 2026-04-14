@@ -32,13 +32,13 @@ export async function appendBtcPriceHistory(feed: BtcPriceFeed): Promise<void> {
 export async function getBtcPriceHistory(): Promise<BtcPriceFeed[]> {
   const redis = getRedisClient();
   const rawList = await redis.lrange(REDIS_KEYS.btcPriceHistory, 0, -1);
-  return rawList.map((raw) => JSON.parse(raw) as BtcPriceFeed);
+  return rawList.map((raw: string) => JSON.parse(raw) as BtcPriceFeed);
 }
 
 export async function getChainlinkBtcPriceHistory(): Promise<ChainlinkBtcPriceFeed[]> {
   const redis = getRedisClient();
   const rawList = await redis.lrange(REDIS_KEYS.chainlinkBtcPriceHistory, 0, -1);
-  return rawList.map((raw) => JSON.parse(raw) as ChainlinkBtcPriceFeed);
+  return rawList.map((raw: string) => JSON.parse(raw) as ChainlinkBtcPriceFeed);
 }
 
 export async function getBtcPrice(): Promise<BtcPriceFeed | null> {
@@ -91,10 +91,9 @@ export async function appendChainlinkPriceHistory(feed: ChainlinkBtcPriceFeed): 
  * Return the Chainlink BTC price whose chainlinkTs falls exactly on a
  * 15-minute boundary AND matches windowTs.
  *
- * Polymarket's strike price is defined by the Chainlink oracle reading whose
- * unix-second timestamp is divisible by 900 (i.e. a 15-min boundary).
- * Because the feed publishes every second, there should be exactly one entry
- * in history with chainlinkTs/1000 === windowTs.
+ * Legacy helper retained for diagnostics and price-comparison tooling.
+ * marketDiscovery now sources strikePrice from Vatic's active-target API
+ * instead of this Redis-backed Chainlink history lookup.
  *
  * Returns null if no exact boundary entry is found (chainlinkPriceFeeder was
  * not running at that second).

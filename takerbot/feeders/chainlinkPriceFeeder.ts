@@ -4,9 +4,9 @@
  * Connects to Polymarket's live-data WebSocket and subscribes to the
  * crypto_prices_chainlink topic, filtering for BTC/USD.
  *
- * The Chainlink BTC/USD price is what Polymarket uses as the strike price
- * when a new 15-minute BTC market opens.  fairValueUpdater reads the latest
- * snapshot from Redis on each market rotation to set STRIKE_PRICE.
+ * Tracks Polymarket's Chainlink BTC/USD feed for monitoring and diagnostics.
+ * Strike price selection is handled separately by marketDiscovery via Vatic's
+ * active-target API for the current 15-minute window.
  *
  * Redis:
  *   SET  feed:chainlink:btc:price  { price, ts, chainlinkTs }

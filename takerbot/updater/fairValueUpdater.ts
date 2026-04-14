@@ -7,7 +7,7 @@
  *
  * Model: binary-option (cash-or-nothing) with time decay.
  *   FV = clamp( N( ln(S/K) / (σ × √T) ), 0.01, 0.99 )
- *   K = Chainlink BTC/USD price at window open (set by marketDiscovery)
+ *   K = strike price from marketDiscovery for the active 15-min window
  *   S = current Binance BTC mid price
  *   T = time-to-expiry in years
  *   σ = BTC_SIGMA_ANNUAL (annualised volatility)
@@ -126,7 +126,7 @@ async function computeAndPublish(
 
   // ── Require a valid strike price ──────────────────────────────────────────
   if (STRIKE_PRICE === null) {
-    console.log('[fairValueUpdater] no strike price — forbidden (chainlink feeder not running?)');
+    console.log('[fairValueUpdater] no strike price — forbidden (marketDiscovery has no Vatic target yet)');
     return;
   }
 
@@ -213,15 +213,15 @@ async function rotateToMarket(
 
   MARKET_ID = newMarketId;
   EXPIRY_TS = info.expiryTs;
-  STRIKE_PRICE = info.strikePrice; // set by marketDiscovery from Chainlink history
+  STRIKE_PRICE = info.strikePrice; // set by marketDiscovery from Vatic active target
 
   if (STRIKE_PRICE === null) {
     console.warn(
       '[fairValueUpdater] strike price is null — trading forbidden until next rotation ' +
-      '(is chainlinkPriceFeeder running?)'
+      '(Vatic target unavailable)'
     );
   } else {
-    console.log(`[fairValueUpdater] STRIKE_PRICE=$${STRIKE_PRICE.toFixed(2)} (from Chainlink)`);
+    console.log(`[fairValueUpdater] STRIKE_PRICE=$${STRIKE_PRICE.toFixed(2)} (from Vatic target)`);
   }
 
   await sub.subscribe(REDIS_CHANNELS.orderbookUpdated(MARKET_ID));

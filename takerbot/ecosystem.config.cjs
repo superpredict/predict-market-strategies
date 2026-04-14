@@ -48,8 +48,7 @@ module.exports = {
 
     // ── Shared: Chainlink BTC/USD price feeder (one instance) ──────────────
     // Subscribes to Polymarket's crypto_prices_chainlink WS topic and stores
-    // the latest BTC/USD price in Redis.  fairValueUpdater reads this on each
-    // market rotation to set the Chainlink-based strike price.
+    // the latest BTC/USD price in Redis for monitoring/diagnostics.
     {
       name: 'chainlinkPriceFeeder',
       script: TSX,

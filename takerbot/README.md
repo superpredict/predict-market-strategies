@@ -1,6 +1,6 @@
 # takerbot — Polymarket BTC 15-Min Taker Strategy
 
-> **Version 3 — Chainlink Strike Price + BTC Stale Forbid**
+> **Version 4 — Vatic Strike Price + BTC Stale Forbid**
 > Targets "Bitcoin Up or Down" 15-min markets on Polymarket.
 > Market identity is discovered automatically — no CLI arguments required.
 > All processes hot-swap to the next 15-min window without restarting.
@@ -17,7 +17,7 @@
 │  ┌──────────────────────────────────────────────────────────────┐    │
 │  │                                                              │    │
 │  │  [marketDiscovery]   Gamma API → detects new 15-min window   │    │
-│  │         │  reads Chainlink history → sets strike price       │    │
+│  │         │  fetches Vatic active target → sets strike price   │    │
 │  │         │  publishes ActiveMarketInfo every ~15 min          │    │
 │  │         │  Redis channel: market:new-active-market           │    │
 │  │         │  Redis key:     market:active-btc15m (cold-start)  │    │
@@ -34,7 +34,7 @@
 │  │  │         └──────────────────────┴──────────────┘      │    │    │
 │  │  │                    │ Redis pub/sub                   │    │    │
 │  │  │                    ▼                                 │    │    │
-│  │  │  [fairValueUpdater]  Chainlink-strike FV → Redis     │    │    │
+│  │  │  [fairValueUpdater]  strike-based FV → Redis         │    │    │
 │  │  │                    │ Redis pub/sub (fv:updated:*)    │    │    │
 │  │  │                    ▼                                 │    │    │
 │  │  │  [takerbot]          BUY/SELL if edge ≥ threshold    │    │    │
@@ -51,9 +51,9 @@
 
 | Process | Instances | Role |
 |---|---|---|
-| `marketDiscovery` | 1 (shared) | Polls Gamma API every 60 s; reads Chainlink history to set strike price; publishes market info on each 15-min window |
+| `marketDiscovery` | 1 (shared) | Polls Gamma API every 60 s; fetches Vatic active target price for the current 15-min window; publishes market info on each rotation |
 | `btcPriceFeeder` | 1 (shared) | Binance WS → BTC mid price → Redis (ping/pong keepalive, exponential backoff, 23 h forced reconnect) |
-| `chainlinkPriceFeeder` | 1 (shared) | Polymarket `crypto_prices_chainlink` WS → BTC/USD price history → Redis; used by `marketDiscovery` to set the strike price at each window open |
+| `chainlinkPriceFeeder` | 1 (shared) | Polymarket `crypto_prices_chainlink` WS → BTC/USD price history → Redis for monitoring/diagnostics |
 | `marketPriceFeeder` | 1 (shared) | Polymarket CLOB WS → orderbook → Redis; hot-swaps token on rotation |
 | `fairValueUpdater` | 1 (shared) | Subscribes feeds → STRIKE model FV → Redis; hard-forbids on stale BTC or missing strike |
 | `takerbot` | 1 (shared) | Strategy: subscribes FV → places taker orders; restarts TakerStrategy on rotation |
@@ -68,8 +68,8 @@ Every 15 minutes:
        │                     │                          │
        │── GET slug ──▶ Gamma API                       │
        │◀── market data ──────────────────────          │
-       │── GET chainlink history ──▶ Redis              │
-       │   (find price closest to windowTs)             │
+       │── GET Vatic target ──▶ api.vatic.trading       │
+       │   (match target.windowStart to windowTs)       │
        │── SET market:active-btc15m ─▶ Redis            │
        │── PUBLISH market:new-active-market ──▶ Redis ──▶ (hot-swap)
        │                                                 │
@@ -88,16 +88,17 @@ Every 15 minutes:
 
 ### STRIKE model
 
-For each 15-minute window, Polymarket uses the Chainlink BTC/USD oracle price at window
-open as the strike price. `marketDiscovery` reads the Chainlink price history from Redis
-and finds the entry whose `chainlinkTs` is closest to the window start timestamp, then
-publishes it inside `ActiveMarketInfo.strikePrice`. `fairValueUpdater` uses this directly.
+For each 15-minute window, `marketDiscovery` fetches the active BTC `15min` target from
+`https://api.vatic.trading/api/v1/targets/active?asset=btc&types=15min` and uses the
+entry whose `windowStart` exactly matches the discovered Polymarket window start. That
+price is published inside `ActiveMarketInfo.strikePrice`, and `fairValueUpdater` uses it
+directly.
 
 ```
 FV = clamp(0.5 + (S − K) / K × FV_SCALE, 0.05, 0.95)
 
 S = current BTC price (Binance mid)
-K = strike price (Chainlink BTC/USD at window open)
+K = strike price (Vatic active target price for the window)
 ```
 
 Examples with `FV_SCALE = 5`:
@@ -123,9 +124,9 @@ Confidence therefore only reflects **orderbook freshness** and **time-to-expiry*
 
 ### No-Strike Guard
 
-If `chainlinkPriceFeeder` was not running when a new window started and no Chainlink
-price is available, `strikePrice` is `null` and `fairValueUpdater` hard-forbids all
-trading until the next market rotation.
+If the Vatic target API does not return a valid target for the discovered window,
+`strikePrice` is `null` and `fairValueUpdater` hard-forbids all trading until the next
+market rotation.
 
 ### Decision rule
 
@@ -136,7 +137,7 @@ SELL when  marketBid  >  FV + edgeThreshold   (market overpriced)
 
 **Safety guards:**
 - Hard-forbid if BTC feed is older than `BTC_STALE_FORBID_MS` (30 s)
-- Hard-forbid if `strikePrice` is null (Chainlink not available at window open)
+- Hard-forbid if `strikePrice` is null (Vatic target unavailable for the active window)
 - Stop trading `STOP_TRADING_BEFORE_EXPIRY_MS` (60 s) before expiry
 - Skip if model confidence < `MIN_CONFIDENCE` (18%)
 - Cap exposure at `MAX_EXPOSURE_USDC` per market
@@ -182,7 +183,7 @@ takerbot/
 ├── feeders/
 │   ├── btcPriceFeeder.ts        Binance bookTicker WS → Redis
 │   ├── chainlinkPriceFeeder.ts  Polymarket Chainlink WS → BTC/USD price + history
-│   ├── marketDiscovery.ts       Gamma API polling → strike price via Chainlink history → market:new-active-market
+│   ├── marketDiscovery.ts       Gamma API polling + Vatic target fetch → market:new-active-market
 │   └── marketPriceFeeder.ts     Polymarket CLOB WS → Redis (auto-rotates on new market)
 ├── updater/
 │   └── fairValueUpdater.ts   STRIKE model FV (auto-rotates, hard-forbids on stale data)
@@ -229,7 +230,7 @@ Open 7 terminals, or use PM2:
 node --import tsx/esm takerbot/feeders/btcPriceFeeder.ts
 ```
 
-**Terminal 2 — Chainlink price feeder (Polymarket):**
+**Terminal 2 — Chainlink price feeder (Polymarket, optional diagnostics):**
 ```bash
 node --import tsx/esm takerbot/feeders/chainlinkPriceFeeder.ts
 ```
@@ -281,7 +282,7 @@ pm2 save && pm2 startup
 |---|---|---|---|
 | `feed:btc:price` | STRING (TTL 60 s) | `btcPriceFeeder` | `fairValueUpdater` |
 | `feed:chainlink:btc:price` | STRING (TTL 120 s) | `chainlinkPriceFeeder` | *(latest snapshot)* |
-| `feed:chainlink:btc:price:history` | LIST (max 30, TTL 45 min) | `chainlinkPriceFeeder` | `marketDiscovery` (strike price lookup) |
+| `feed:chainlink:btc:price:history` | LIST (max 30, TTL 45 min) | `chainlinkPriceFeeder` | diagnostics / price comparison tools |
 | `market:active-btc15m` | STRING (TTL 30 min) | `marketDiscovery` | all processes (cold-start) |
 | `feed:market:{id}:orderbook` | STRING | `marketPriceFeeder` | `fairValueUpdater`, `takerbot` |
 | `fv:{id}` | STRING | `fairValueUpdater` | `takerbot` (slow-tick fallback) |
@@ -316,7 +317,7 @@ Target: **< 50ms** from FV change to order submission.
 ## Known Limitations
 
 - **No hedge**: pure directional taker, no cross-venue risk reduction
-- **Chainlink dependency**: if `chainlinkPriceFeeder` is down at market rotation, `strikePrice` will be null and trading is forbidden for that window
+- **Vatic target dependency**: if the Vatic `active` target API does not return a valid `15min` BTC target for the current window, `strikePrice` will be null and trading is forbidden for that window
 - **Single WS per feeder**: one Polymarket WS subscription at a time (sufficient for single-market strategy)
 - **No fill confirmation**: `fetchOrder` is not polled; position tracking is optimistic
 

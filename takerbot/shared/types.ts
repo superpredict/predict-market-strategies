@@ -75,7 +75,7 @@ export interface ActiveMarketInfo {
   question: string;
   yesTokenId: string;
   noTokenId: string;
-  /** Strike price in USD — Chainlink BTC/USD price at window open; null if Chainlink unavailable */
+  /** Strike price in USD — Vatic active target for this window; null if unavailable */
   strikePrice: number | null;
   /** ISO-8601 end date string */
   endDate: string;
@@ -97,7 +97,7 @@ export interface MarketConfig {
   yesTokenId: string;
   /** Token ID for the "No" outcome */
   noTokenId: string;
-  /** Strike price in USD — Chainlink BTC/USD price at window open */
+  /** Strike price in USD — Vatic active target for this window */
   strikePrice: number | null;
   expiryTime: Date;
   /** USDC amount per trade */

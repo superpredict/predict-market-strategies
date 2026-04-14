@@ -19,7 +19,7 @@
 import dotenv from 'dotenv';
 import { MARKET_DISCOVERY_POLL_MS } from '../config/constants.js';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { getChainlinkStrikeForWindow, setActiveMarket } from '../shared/state.js';
+import { setActiveMarket } from '../shared/state.js';
 import { REDIS_CHANNELS, type ActiveMarketInfo } from '../shared/types.js';
 
 dotenv.config();
@@ -27,6 +27,7 @@ dotenv.config();
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const GAMMA_API_BASE = 'https://gamma-api.polymarket.com';
+const VATIC_TARGETS_URL = 'https://api.vatic.trading/api/v1/targets/active?asset=btc&types=15min';
 const SLUG_PREFIX = 'btc-updown-15m';
 const WINDOW_SECONDS = 900; // 15 minutes
 
@@ -40,6 +41,21 @@ interface GammaMarketResponse {
   clobTokenIds: string; // JSON-encoded string array, e.g. '["tokenA","tokenB"]'
   active: boolean;
   closed: boolean;
+}
+
+interface VaticTarget {
+  marketType: string;
+  ok: boolean;
+  windowStart: number;
+  windowStartIso: string;
+  source: string;
+  price: number;
+}
+
+interface VaticTargetsResponse {
+  now: string;
+  asset: string;
+  results: VaticTarget[];
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -56,6 +72,41 @@ async function fetchMarketBySlug(slug: string): Promise<GammaMarketResponse | nu
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Gamma API ${res.status}: ${res.statusText} for ${url}`);
   return res.json() as Promise<GammaMarketResponse>;
+}
+
+async function fetchStrikePrice(windowTs: number): Promise<number | null> {
+  const res = await fetch(VATIC_TARGETS_URL);
+  if (!res.ok) {
+    throw new Error(`Vatic targets API ${res.status}: ${res.statusText} for ${VATIC_TARGETS_URL}`);
+  }
+
+  const body = (await res.json()) as VaticTargetsResponse;
+  const target = body.results.find(
+    (item) => item.marketType === '15min' && item.windowStart === windowTs
+  );
+
+  if (!target) {
+    const windows = body.results.map((item) => item.windowStartIso).join(', ') || 'none';
+    console.warn(
+      `[marketDiscovery] Vatic targets API returned no 15min target for windowTs=${windowTs} ` +
+      `(available windows: ${windows})`
+    );
+    return null;
+  }
+
+  if (!target.ok || !Number.isFinite(target.price) || target.price <= 0) {
+    console.warn(
+      `[marketDiscovery] Vatic target invalid for windowTs=${windowTs}: ` +
+      `ok=${target.ok} price=${target.price}`
+    );
+    return null;
+  }
+
+  console.log(
+    `[marketDiscovery] Vatic strike target $${target.price.toFixed(2)} ` +
+    `(source=${target.source}, windowStart=${target.windowStartIso})`
+  );
+  return target.price;
 }
 
 // ─── Core discovery logic ─────────────────────────────────────────────────────
@@ -103,11 +154,8 @@ async function checkAndPublish(): Promise<void> {
     return;
   }
 
-  // ── Strike price: Chainlink BTC/USD price at window open ──────────────────
-  // Polymarket's strike is the Chainlink oracle reading whose unix-second
-  // timestamp is exactly the 15-min boundary (divisible by 900).
-  // getChainlinkStrikeForWindow finds the entry where chainlinkTs/1000 === windowTs.
-  const strikePrice = await getChainlinkStrikeForWindow(windowTs);
+  // ── Strike price: Vatic active target for the detected 15-min window ──────
+  const strikePrice = await fetchStrikePrice(windowTs);
 
   const info: ActiveMarketInfo = {
     conditionId: market.conditionId,
@@ -130,8 +178,8 @@ async function checkAndPublish(): Promise<void> {
 
   const strikeLine =
     info.strikePrice !== null
-      ? `$${info.strikePrice.toLocaleString()} (chainlink)`
-      : 'N/A — chainlinkPriceFeeder not running yet';
+      ? `$${info.strikePrice.toLocaleString()} (vatic active target)`
+      : 'N/A — Vatic target unavailable';
 
   console.log(
     `[marketDiscovery] published market` +
