@@ -8,11 +8,11 @@
  * Model: binary-option (cash-or-nothing) with time decay.
  *   FV = clamp( N( ln(S/K) / (σ × √T) ), 0.01, 0.99 )
  *   K = strike price from marketDiscovery for the active 15-min window
- *   S = current Binance BTC mid price
+ *   S = current Chainlink BTC/USD price
  *   T = time-to-expiry in years
  *   σ = BTC_SIGMA_ANNUAL (annualised volatility)
  *
- * BTC staleness guard:
+ * Chainlink staleness guard:
  *   If the BTC feed is older than BTC_STALE_FORBID_MS, trading is hard-forbidden
  *   (early return). Confidence therefore only reflects orderbook freshness and
  *   time-to-expiry.
@@ -28,14 +28,14 @@ import {
 import { closeRedis, getRedisClient, getSubscriberClient } from '../shared/redis.js';
 import {
   getActiveMarket,
-  getBtcPrice,
+  getChainlinkBtcPrice,
   getOrderbook,
   setFairValue,
 } from '../shared/state.js';
 import {
   REDIS_CHANNELS,
   type ActiveMarketInfo,
-  type BtcPriceFeed,
+  type ChainlinkBtcPriceFeed,
   type FairValue,
   type MarketOrderbookFeed,
 } from '../shared/types.js';
@@ -107,18 +107,18 @@ function computeConfidence(obTs: number, timeToExpiryMs: number): ConfidenceResu
 // ─── Core Computation ────────────────────────────────────────────────────────
 
 async function computeAndPublish(
-  btcFeed: BtcPriceFeed,
+  btcFeed: ChainlinkBtcPriceFeed,
   obFeed: MarketOrderbookFeed
 ): Promise<void> {
   if (!MARKET_ID) return;
 
   const now = Date.now();
 
-  // ── Hard-forbid on stale BTC ──────────────────────────────────────────────
+  // ── Hard-forbid on stale Chainlink BTC ────────────────────────────────────
   const btcAgeMs = now - btcFeed.ts;
   if (btcAgeMs > BTC_STALE_FORBID_MS) {
     console.log(
-      `[fairValueUpdater] STALE BTC (${(btcAgeMs / 1000).toFixed(1)}s > ` +
+      `[fairValueUpdater] STALE CHAINLINK BTC (${(btcAgeMs / 1000).toFixed(1)}s > ` +
       `${BTC_STALE_FORBID_MS / 1000}s) — forbidden`
     );
     return;
@@ -181,7 +181,7 @@ async function computeAndPublish(
   console.log(
     `[fairValueUpdater] STRIKE FV=${(value * 100).toFixed(2)}% ` +
     `conf=${(confidence * 100).toFixed(0)}% ` +
-    `btc=$${btcFeed.price.toFixed(2)} ` +
+    `chainlink=$${btcFeed.price.toFixed(2)} ` +
     `strike=$${STRIKE_PRICE.toFixed(2)} ` +
     `yesAsk=${(obFeed.bestAsk || 0).toFixed(4)} ` +
     `tte=${Math.round(timeToExpiryMs / 1000)}s`
@@ -237,11 +237,11 @@ async function rotateToMarket(
 async function start(): Promise<void> {
   const sub = getSubscriberClient();
 
-  const btcChannel = REDIS_CHANNELS.btcPriceUpdated;
+  const chainlinkChannel = REDIS_CHANNELS.chainlinkBtcPriceUpdated;
   const discoveryChannel = REDIS_CHANNELS.newActiveMarket;
 
-  await sub.subscribe(btcChannel, discoveryChannel);
-  console.log(`[fairValueUpdater] subscribed to ${btcChannel} and ${discoveryChannel}`);
+  await sub.subscribe(chainlinkChannel, discoveryChannel);
+  console.log(`[fairValueUpdater] subscribed to ${chainlinkChannel} and ${discoveryChannel}`);
 
   sub.on('message', (channel: string, message: string) => {
     void (async () => {
@@ -256,14 +256,14 @@ async function start(): Promise<void> {
         isProcessing = true;
 
         try {
-          if (channel === btcChannel) {
-            const btcFeed = JSON.parse(message) as BtcPriceFeed;
+          if (channel === chainlinkChannel) {
+            const btcFeed = JSON.parse(message) as ChainlinkBtcPriceFeed;
             const obFeed = await getOrderbook(MARKET_ID);
             if (!obFeed) return;
             await computeAndPublish(btcFeed, obFeed);
           } else if (channel === REDIS_CHANNELS.orderbookUpdated(MARKET_ID)) {
             const obFeed = JSON.parse(message) as MarketOrderbookFeed;
-            const btcFeed = await getBtcPrice();
+            const btcFeed = await getChainlinkBtcPrice();
             if (!btcFeed) return;
             await computeAndPublish(btcFeed, obFeed);
           }

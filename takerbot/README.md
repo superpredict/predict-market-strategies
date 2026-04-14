@@ -28,7 +28,7 @@
 │  │  │                                                      │    │    │
 │  │  │  [btcPriceFeeder]         Binance WS → BTC bid/ask   │    │    │
 │  │  │  [chainlinkPriceFeeder]   Polymarket Chainlink WS    │    │    │
-│  │  │                           → BTC/USD price history    │    │    │
+│  │  │                           → BTC/USD spot snapshots   │    │    │
 │  │  │  [marketPriceFeeder]      Polymarket WS → orderbook  │    │    │
 │  │  │         │                      │              │      │    │    │
 │  │  │         └──────────────────────┴──────────────┘      │    │    │
@@ -53,9 +53,9 @@
 |---|---|---|
 | `marketDiscovery` | 1 (shared) | Polls Gamma API every 60 s; fetches Vatic active target price for the current 15-min window; publishes market info on each rotation |
 | `btcPriceFeeder` | 1 (shared) | Binance WS → BTC mid price → Redis (ping/pong keepalive, exponential backoff, 23 h forced reconnect) |
-| `chainlinkPriceFeeder` | 1 (shared) | Polymarket `crypto_prices_chainlink` WS → BTC/USD price history → Redis for monitoring/diagnostics |
+| `chainlinkPriceFeeder` | 1 (shared) | Polymarket `crypto_prices_chainlink` WS → BTC/USD price → Redis for fair value input and diagnostics |
 | `marketPriceFeeder` | 1 (shared) | Polymarket CLOB WS → orderbook → Redis; hot-swaps token on rotation |
-| `fairValueUpdater` | 1 (shared) | Subscribes feeds → STRIKE model FV → Redis; hard-forbids on stale BTC or missing strike |
+| `fairValueUpdater` | 1 (shared) | Subscribes Chainlink BTC + orderbook feeds → STRIKE model FV → Redis; hard-forbids on stale Chainlink BTC or missing strike |
 | `takerbot` | 1 (shared) | Strategy: subscribes FV → places taker orders; restarts TakerStrategy on rotation |
 | `portfolioTracker` | 1 (shared) | Subscribes fills → P&L accounting |
 
@@ -95,25 +95,18 @@ price is published inside `ActiveMarketInfo.strikePrice`, and `fairValueUpdater`
 directly.
 
 ```
-FV = clamp(0.5 + (S − K) / K × FV_SCALE, 0.05, 0.95)
+FV = clamp( N( ln(S / K) / (σ × √T) ), 0.01, 0.99 )
 
-S = current BTC price (Binance mid)
+S = current BTC price (Chainlink BTC/USD)
 K = strike price (Vatic active target price for the window)
+T = time-to-expiry in years
+σ = BTC_SIGMA_ANNUAL
+N = standard normal CDF
 ```
-
-Examples with `FV_SCALE = 5`:
-
-| BTC vs strike | Relative distance | FV |
-|---|---|---|
-| +2% above | +0.02 | 0.60 |
-| +5% above | +0.05 | 0.75 |
-| at strike  | 0.00  | 0.50 |
-| −2% below  | −0.02 | 0.40 |
-| −10%+ below | ≤ −0.10 | 0.05 (clamped) |
 
 ### BTC Staleness Guard
 
-`fairValueUpdater` hard-forbids trading if the Binance BTC feed is older than
+`fairValueUpdater` hard-forbids trading if the Chainlink BTC feed is older than
 `BTC_STALE_FORBID_MS` (30 s):
 
 ```
@@ -136,7 +129,7 @@ SELL when  marketBid  >  FV + edgeThreshold   (market overpriced)
 ```
 
 **Safety guards:**
-- Hard-forbid if BTC feed is older than `BTC_STALE_FORBID_MS` (30 s)
+- Hard-forbid if Chainlink BTC feed is older than `BTC_STALE_FORBID_MS` (30 s)
 - Hard-forbid if `strikePrice` is null (Vatic target unavailable for the active window)
 - Stop trading `STOP_TRADING_BEFORE_EXPIRY_MS` (60 s) before expiry
 - Skip if model confidence < `MIN_CONFIDENCE` (18%)
@@ -151,7 +144,7 @@ SELL when  marketBid  >  FV + edgeThreshold   (market overpriced)
 | Constant | Default | Description |
 |---|---|---|
 | `FV_SCALE` | `5` | Sensitivity: 1% distance from strike → ±0.05 FV |
-| `BTC_STALE_FORBID_MS` | `30_000` (30 s) | Hard-forbid trading when Binance BTC feed is older than this |
+| `BTC_STALE_FORBID_MS` | `30_000` (30 s) | Hard-forbid trading when Chainlink BTC feed is older than this |
 | `MIN_CONFIDENCE` | `0.18` | Minimum model confidence (0–1) required to trade |
 | `STOP_TRADING_BEFORE_EXPIRY_MS` | `60_000` (60 s) | Halt trading this far before expiry |
 | `MAX_EXPOSURE_USDC` | `200` | Max open USDC exposure per market |
@@ -182,7 +175,7 @@ takerbot/
 │   └── state.ts              Typed get/set helpers for Redis
 ├── feeders/
 │   ├── btcPriceFeeder.ts        Binance bookTicker WS → Redis
-│   ├── chainlinkPriceFeeder.ts  Polymarket Chainlink WS → BTC/USD price + history
+│   ├── chainlinkPriceFeeder.ts  Polymarket Chainlink WS → BTC/USD snapshots + history
 │   ├── marketDiscovery.ts       Gamma API polling + Vatic target fetch → market:new-active-market
 │   └── marketPriceFeeder.ts     Polymarket CLOB WS → Redis (auto-rotates on new market)
 ├── updater/
@@ -230,7 +223,7 @@ Open 7 terminals, or use PM2:
 node --import tsx/esm takerbot/feeders/btcPriceFeeder.ts
 ```
 
-**Terminal 2 — Chainlink price feeder (Polymarket, optional diagnostics):**
+**Terminal 2 — Chainlink price feeder (Polymarket, required for fair value):**
 ```bash
 node --import tsx/esm takerbot/feeders/chainlinkPriceFeeder.ts
 ```
@@ -280,16 +273,16 @@ pm2 save && pm2 startup
 
 | Key / Channel | Type | Written by | Read by |
 |---|---|---|---|
-| `feed:btc:price` | STRING (TTL 60 s) | `btcPriceFeeder` | `fairValueUpdater` |
-| `feed:chainlink:btc:price` | STRING (TTL 120 s) | `chainlinkPriceFeeder` | *(latest snapshot)* |
+| `feed:btc:price` | STRING (TTL 60 s) | `btcPriceFeeder` | diagnostics / price comparison tools |
+| `feed:chainlink:btc:price` | STRING (TTL 120 s) | `chainlinkPriceFeeder` | `fairValueUpdater` |
 | `feed:chainlink:btc:price:history` | LIST (max 30, TTL 45 min) | `chainlinkPriceFeeder` | diagnostics / price comparison tools |
 | `market:active-btc15m` | STRING (TTL 30 min) | `marketDiscovery` | all processes (cold-start) |
 | `feed:market:{id}:orderbook` | STRING | `marketPriceFeeder` | `fairValueUpdater`, `takerbot` |
 | `fv:{id}` | STRING | `fairValueUpdater` | `takerbot` (slow-tick fallback) |
 | `position:{id}` | STRING (TTL 24 h) | `takerbot` | `portfolioTracker` |
 | `portfolio:snapshot` | STRING (TTL 24 h) | `portfolioTracker` | `portfolioTracker` |
-| `btc:price:updated` | CHANNEL | `btcPriceFeeder` | `fairValueUpdater` |
-| `chainlink:btc:price:updated` | CHANNEL | `chainlinkPriceFeeder` | *(available for future use)* |
+| `btc:price:updated` | CHANNEL | `btcPriceFeeder` | diagnostics / price comparison tools |
+| `chainlink:btc:price:updated` | CHANNEL | `chainlinkPriceFeeder` | `fairValueUpdater` |
 | `market:new-active-market` | CHANNEL | `marketDiscovery` | `marketPriceFeeder`, `fairValueUpdater`, `takerbot` |
 | `market:orderbook:updated:{id}` | CHANNEL | `marketPriceFeeder` | `fairValueUpdater` |
 | `fv:updated:{id}` | CHANNEL | `fairValueUpdater` | `takerbot` |

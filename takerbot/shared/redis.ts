@@ -1,4 +1,4 @@
-import Redis from 'ioredis';
+import { Redis } from 'ioredis';
 import { REDIS_URL } from '../config/constants.js';
 
 let _client: Redis | null = null;
@@ -16,7 +16,7 @@ export function getRedisClient(): Redis {
       lazyConnect: false,
     });
 
-    _client.on('error', (err) => {
+    _client.on('error', (err: Error) => {
       console.error('[redis] client error:', err.message);
     });
 
@@ -40,7 +40,7 @@ export function getSubscriberClient(): Redis {
       lazyConnect: false,
     });
 
-    _subscriber.on('error', (err) => {
+    _subscriber.on('error', (err: Error) => {
       console.error('[redis:sub] subscriber error:', err.message);
     });
   }

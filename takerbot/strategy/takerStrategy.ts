@@ -49,8 +49,6 @@ export class TakerStrategy extends Strategy {
   /** Tracks the publishedAt of the last FV we actually evaluated, to deduplicate slow-tick re-processing. */
   private lastProcessedFvPublishedAt = 0;
 
-  private latencyStats: number[] = [];
-
   /** Tracks the currently-subscribed fair-value channel so we can unsubscribe on rotation. */
   private currentFvChannel: string | null = null;
   /** Bound handler reference so we can call sub.off() on rotation. */
@@ -123,7 +121,6 @@ export class TakerStrategy extends Strategy {
     this.isProcessing = false;
     this.lastProcessedFvTs = 0;
     this.lastProcessedFvPublishedAt = 0;
-    this.latencyStats = [];
 
     // Re-subscribe the fair-value channel for the new market
     await this.subscribeToFairValueUpdates();
