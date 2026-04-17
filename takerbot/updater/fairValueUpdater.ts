@@ -174,6 +174,7 @@ async function computeAndPublish(
     marketId: MARKET_ID,
     fairValue: value,
     confidence,
+    sigma: sigmaPerSecond,
     btcPrice: btcFeed.price,
     strikePrice: STRIKE_PRICE,
     timeToExpiryMs,

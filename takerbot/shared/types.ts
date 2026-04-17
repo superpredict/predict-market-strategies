@@ -51,6 +51,7 @@ export interface MarketReportPoint {
   marketId: string;
   fairValue: number;
   confidence: number;
+  sigma: number | null;
   btcPrice: number;
   strikePrice: number | null;
   timeToExpiryMs: number;

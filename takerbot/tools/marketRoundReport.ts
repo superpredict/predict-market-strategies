@@ -59,6 +59,7 @@ function computeRows(rows: MarketReportPoint[]): ComputedReportRow[] {
 
     computed.push({
       ...row,
+      sigma: row.sigma ?? null,
       isoTime: new Date(row.ts).toISOString(),
       chainlinkPrice: row.btcPrice,
       yesTokenPrice,
@@ -77,6 +78,9 @@ function computeSummary(rows: ComputedReportRow[]) {
       avgF: null,
       minF: null,
       maxF: null,
+      avgSigma: null,
+      minSigma: null,
+      maxSigma: null,
       avgResidual: null,
       minResidual: null,
       maxResidual: null,
@@ -84,6 +88,9 @@ function computeSummary(rows: ComputedReportRow[]) {
   }
 
   const fValues = rows.map((row) => row.f);
+  const sigmaValues = rows
+    .map((row) => row.sigma)
+    .filter((value): value is number => value !== null);
   const residuals = rows
     .map((row) => row.fMinusG)
     .filter((value): value is number => value !== null);
@@ -95,6 +102,9 @@ function computeSummary(rows: ComputedReportRow[]) {
     avgF: average(fValues),
     minF: Math.min(...fValues),
     maxF: Math.max(...fValues),
+    avgSigma: average(sigmaValues),
+    minSigma: sigmaValues.length > 0 ? Math.min(...sigmaValues) : null,
+    maxSigma: sigmaValues.length > 0 ? Math.max(...sigmaValues) : null,
     avgResidual: average(residuals),
     minResidual: residuals.length > 0 ? Math.min(...residuals) : null,
     maxResidual: residuals.length > 0 ? Math.max(...residuals) : null,
@@ -108,6 +118,7 @@ function toCsv(rows: ComputedReportRow[]): string {
     'published_at',
     'fair_value',
     'confidence',
+    'sigma',
     'chainlink_price',
     'btc_price',
     'strike_price',
@@ -130,6 +141,7 @@ function toCsv(rows: ComputedReportRow[]): string {
       String(row.publishedAt),
       formatNum(row.fairValue),
       formatNum(row.confidence),
+      formatMaybeNumber(row.sigma),
       formatNum(row.chainlinkPrice, 2),
       formatNum(row.btcPrice, 2),
       formatMaybeNumber(row.strikePrice, 2),
@@ -170,6 +182,7 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('');
   lines.push('- `chainlink price(t)` is the Chainlink BTC/USD spot used by the fair value model.');
   lines.push('- `yes token price(t)` uses `yes ask`.');
+  lines.push('- `sigma(t)` is the per-second EWMA volatility used by the fair value model.');
   lines.push('- `f(t) = fair value(t) - yes token price(t)`.');
   lines.push('- `g(t)` is the 5-point moving average of `f(t)` and is blank until 5 samples exist.');
   lines.push('');
@@ -180,18 +193,21 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push(`- avg f(t): ${formatMaybeNumber(summary.avgF) || 'N/A'}`);
   lines.push(`- min f(t): ${formatMaybeNumber(summary.minF) || 'N/A'}`);
   lines.push(`- max f(t): ${formatMaybeNumber(summary.maxF) || 'N/A'}`);
+  lines.push(`- avg sigma(t): ${formatMaybeNumber(summary.avgSigma) || 'N/A'}`);
+  lines.push(`- min sigma(t): ${formatMaybeNumber(summary.minSigma) || 'N/A'}`);
+  lines.push(`- max sigma(t): ${formatMaybeNumber(summary.maxSigma) || 'N/A'}`);
   lines.push(`- avg f(t)-g(t): ${formatMaybeNumber(summary.avgResidual) || 'N/A'}`);
   lines.push(`- min f(t)-g(t): ${formatMaybeNumber(summary.minResidual) || 'N/A'}`);
   lines.push(`- max f(t)-g(t): ${formatMaybeNumber(summary.maxResidual) || 'N/A'}`);
   lines.push('');
   lines.push('## Rows');
   lines.push('');
-  lines.push('| time | fair value | chainlink price | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f(t)-g(t) |');
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  lines.push('| time | fair value | sigma | chainlink price | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f(t)-g(t) |');
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
 
   for (const row of rows) {
     lines.push(
-      `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatNum(row.chainlinkPrice, 2)} | ` +
+      `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.sigma)} | ${formatNum(row.chainlinkPrice, 2)} | ` +
         `${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ${formatNum(row.noBid)} | ` +
         `${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
         `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} |`,
