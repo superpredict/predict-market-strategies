@@ -30,6 +30,7 @@ import { EWMAVolatility } from '../shared/ewmaVolatility.js';
 import { closeRedis, getRedisClient, getSubscriberClient } from '../shared/redis.js';
 import { computeBaseFairValue, computeFairValueConfidence } from '../shared/fairValueMath.js';
 import {
+  appendMarketReportRow,
   getActiveMarket,
   getChainlinkBtcPrice,
   getChainlinkBtcPriceHistory,
@@ -56,6 +57,10 @@ const volatilityEstimator = new EWMAVolatility({
   minTicks: VOLATILITY_MIN_TICKS,
 });
 let sigmaNotReadyLogged = false;
+
+function clampOutcomePrice(value: number): number {
+  return Math.min(1, Math.max(0, value));
+}
 
 function getCurrentSigmaPerSecond(): number | null {
   const sigma = volatilityEstimator.getVolatility();
@@ -165,6 +170,20 @@ async function computeAndPublish(
   };
 
   await setFairValue(fv);
+  await appendMarketReportRow({
+    marketId: MARKET_ID,
+    fairValue: value,
+    confidence,
+    btcPrice: btcFeed.price,
+    strikePrice: STRIKE_PRICE,
+    timeToExpiryMs,
+    yesBid: obFeed.bestBid,
+    yesAsk: obFeed.bestAsk,
+    noBid: clampOutcomePrice(1 - obFeed.bestAsk),
+    noAsk: clampOutcomePrice(1 - obFeed.bestBid),
+    publishedAt: now,
+    ts: now,
+  });
 
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.fairValueUpdated(MARKET_ID), JSON.stringify(fv));

@@ -18,6 +18,7 @@
 │  │                                                              │    │
 │  │  [marketDiscovery]   Gamma API → detects new 15-min window   │    │
 │  │         │  fetches Vatic active target → sets strike price   │    │
+│  │         │  auto-generates previous round report on rotation  │    │
 │  │         │  publishes ActiveMarketInfo every ~15 min          │    │
 │  │         │  Redis channel: market:new-active-market           │    │
 │  │         │  Redis key:     market:active-btc15m (cold-start)  │    │
@@ -35,6 +36,7 @@
 │  │  │                    │ Redis pub/sub                   │    │    │
 │  │  │                    ▼                                 │    │    │
 │  │  │  [fairValueUpdater]  strike-based FV → Redis         │    │    │
+│  │  │                      + append report rows            │    │    │
 │  │  │                    │ Redis pub/sub (fv:updated:*)    │    │    │
 │  │  │                    ▼                                 │    │    │
 │  │  │  [takerbot]          BUY/SELL if edge ≥ threshold    │    │    │
@@ -51,11 +53,11 @@
 
 | Process | Instances | Role |
 |---|---|---|
-| `marketDiscovery` | 1 (shared) | Polls Gamma API every 60 s; fetches Vatic active target price for the current 15-min window; publishes market info on each rotation |
+| `marketDiscovery` | 1 (shared) | Polls Gamma API every 60 s; fetches Vatic active target price for the current 15-min window; auto-generates the previous round report when a new round starts; publishes market info on each rotation |
 | `btcPriceFeeder` | 1 (shared) | Binance WS → BTC mid price → Redis (ping/pong keepalive, exponential backoff, 23 h forced reconnect) |
 | `chainlinkPriceFeeder` | 1 (shared) | Polymarket `crypto_prices_chainlink` WS → BTC/USD price → Redis for fair value input and diagnostics |
 | `marketPriceFeeder` | 1 (shared) | Polymarket CLOB WS → orderbook → Redis; hot-swaps token on rotation |
-| `fairValueUpdater` | 1 (shared) | Subscribes Chainlink BTC + orderbook feeds → STRIKE model FV → Redis; hard-forbids on stale Chainlink BTC or missing strike |
+| `fairValueUpdater` | 1 (shared) | Subscribes Chainlink BTC + orderbook feeds → STRIKE model FV → Redis; records per-update report rows; hard-forbids on stale Chainlink BTC or missing strike |
 | `takerbot` | 1 (shared) | Strategy: subscribes FV → places taker orders; restarts TakerStrategy on rotation |
 | `portfolioTracker` | 1 (shared) | Subscribes fills → P&L accounting |
 
@@ -70,6 +72,7 @@ Every 15 minutes:
        │◀── market data ──────────────────────          │
        │── GET Vatic target ──▶ api.vatic.trading       │
        │   (match target.windowStart to windowTs)       │
+       │── GENERATE previous round report (if expired)  │
        │── SET market:active-btc15m ─▶ Redis            │
        │── PUBLISH market:new-active-market ──▶ Redis ──▶ (hot-swap)
        │                                                 │
@@ -152,6 +155,62 @@ SELL when  marketBid  >  FV + edgeThreshold   (market overpriced)
 
 ---
 
+## Market Round Reports
+
+At each market rotation, `marketDiscovery` attempts to generate a report for the
+previous market once that market is expired. Reports are written to
+`takerbot/reports/` as both Markdown and CSV files, with the filename based on the
+market slug (for example `btc-updown-15m-1774851300.md` and `.csv`).
+
+`fairValueUpdater` is the source of the row data. On every successful fair-value
+publish it appends one Redis-backed report row containing:
+
+- fair value
+- confidence
+- BTC price
+- strike price
+- `yes bid` / `yes ask`
+- `no bid` / `no ask`
+- `timeToExpiryMs`
+
+The generated report adds the following derived columns:
+
+```text
+yes token price(t) = yes ask(t)
+f(t) = fair value(t) - yes token price(t)
+g(t) = (f(t) + f(t-1) + f(t-2) + f(t-3) + f(t-4)) / 5
+f(t) - g(t)
+```
+
+Notes:
+
+- `g(t)` is blank until 5 rows are available.
+- `no bid` and `no ask` are currently synthesized from the yes-side book:
+  `no bid = 1 - yes ask`, `no ask = 1 - yes bid`.
+- Per-market report rows are stored in Redis with a 7-day TTL and capped at 5000 rows.
+
+### Manual report generation
+
+Generate for the current active market:
+
+```bash
+npm run takerbot:marketRoundReport -- --active-market
+```
+
+Generate for a specific slug:
+
+```bash
+npm run takerbot:marketRoundReport -- --slug btc-updown-15m-1774851300
+```
+
+Overwrite existing files:
+
+```bash
+npm run takerbot:marketRoundReport -- --slug btc-updown-15m-1774851300 --force
+```
+
+---
+
 ## Tuning Parameters
 
 **Fair value & strategy** (`config/constants.ts`):
@@ -185,6 +244,7 @@ takerbot/
 ├── config/
 │   ├── constants.ts          All tuning parameters (FV_SCALE, BTC_STALE_FORBID_MS, …)
 │   └── markets.ts            buildMarketConfigFromInfo() helper
+├── reports/                  Auto-generated round reports (.md + .csv)
 ├── shared/
 │   ├── types.ts              Shared types + Redis key/channel constants
 │   ├── redis.ts              ioredis client factory (client + subscriber)
@@ -202,6 +262,10 @@ takerbot/
 │   └── takerStrategy.ts      Extends Strategy → event-driven taker logic
 ├── portfolio/
 │   └── portfolioTracker.ts   Fill events → P&L snapshot
+├── tools/
+│   ├── generateMarketRoundReport.ts  Manual report CLI
+│   ├── marketRoundReport.ts          Markdown/CSV report generator
+│   └── priceFeedPairReport.ts        Binance/Chainlink diagnostics
 ├── takerbot.ts               Entry point — market-rotating strategy runner
 └── ecosystem.config.cjs      PM2 process definitions (no per-market args)
 ```
@@ -285,6 +349,12 @@ pm2 start takerbot/ecosystem.config.cjs --env production
 pm2 save && pm2 startup
 ```
 
+### 5. Generate a market report manually
+
+```bash
+npm run takerbot:marketRoundReport -- --active-market
+```
+
 ---
 
 ## Redis Keys & Channels Reference
@@ -295,6 +365,9 @@ pm2 save && pm2 startup
 | `feed:chainlink:btc:price` | STRING (TTL 120 s) | `chainlinkPriceFeeder` | `fairValueUpdater` |
 | `feed:chainlink:btc:price:history` | LIST (max 30, TTL 45 min) | `chainlinkPriceFeeder` | diagnostics / price comparison tools |
 | `market:active-btc15m` | STRING (TTL 30 min) | `marketDiscovery` | all processes (cold-start) |
+| `market:info:{id}` | STRING (TTL 7 d) | `marketDiscovery` | report generator |
+| `market:info:slug:{slug}` | STRING (TTL 7 d) | `marketDiscovery` | report generator |
+| `market:report:rows:{id}` | LIST (max 5000, TTL 7 d) | `fairValueUpdater` | report generator |
 | `feed:market:{id}:orderbook` | STRING | `marketPriceFeeder` | `fairValueUpdater`, `takerbot` |
 | `fv:{id}` | STRING | `fairValueUpdater` | `takerbot` (slow-tick fallback) |
 | `position:{id}` | STRING (TTL 24 h) | `takerbot` | `portfolioTracker` |
@@ -331,6 +404,8 @@ Target: **< 50ms** from FV change to order submission.
 - **Vatic target dependency**: if the Vatic `active` target API does not return a valid `15min` BTC target for the current window, `strikePrice` will be null and trading is forbidden for that window
 - **Single WS per feeder**: one Polymarket WS subscription at a time (sufficient for single-market strategy)
 - **No fill confirmation**: `fetchOrder` is not polled; position tracking is optimistic
+- **Synthetic no-side quotes in reports**: `no bid` / `no ask` are derived from the yes-side top of book, not read from a separate no-side orderbook feed
+- **Report row cap**: per-market report history is capped at 5000 Redis rows
 
 ---
 

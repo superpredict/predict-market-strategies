@@ -47,6 +47,21 @@ export interface FairValue {
   ts: number; // epoch ms
 }
 
+export interface MarketReportPoint {
+  marketId: string;
+  fairValue: number;
+  confidence: number;
+  btcPrice: number;
+  strikePrice: number | null;
+  timeToExpiryMs: number;
+  yesBid: number;
+  yesAsk: number;
+  noBid: number;
+  noAsk: number;
+  publishedAt: number;
+  ts: number; // epoch ms
+}
+
 // ─── Portfolio ────────────────────────────────────────────────────────────────
 
 export interface PortfolioPosition {
@@ -128,9 +143,12 @@ export const REDIS_KEYS = {
    */
   depthPressure: (marketId: string) => `feed:market:${marketId}:depth-pressure`,
   fairValue: (marketId: string) => `fv:${marketId}`,
+  marketReportRows: (marketId: string) => `market:report:rows:${marketId}`,
   position: (marketId: string) => `position:${marketId}`,
   portfolio: 'portfolio:snapshot',
   activeMarket: 'market:active-btc15m',
+  marketInfo: (marketId: string) => `market:info:${marketId}`,
+  marketInfoBySlug: (slug: string) => `market:info:slug:${slug}`,
 } as const;
 
 export const REDIS_CHANNELS = {

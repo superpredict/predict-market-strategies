@@ -19,8 +19,9 @@
 import dotenv from 'dotenv';
 import { MARKET_DISCOVERY_POLL_MS } from '../config/constants.js';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { setActiveMarket } from '../shared/state.js';
+import { getActiveMarket, setActiveMarket } from '../shared/state.js';
 import { REDIS_CHANNELS, type ActiveMarketInfo } from '../shared/types.js';
+import { generateMarketRoundReport } from '../tools/marketRoundReport.js';
 
 dotenv.config();
 
@@ -168,6 +169,26 @@ async function checkAndPublish(): Promise<void> {
     slug: market.slug,
     ts: Date.now(),
   };
+
+  const previousMarket = await getActiveMarket();
+  if (
+    previousMarket &&
+    previousMarket.conditionId !== info.conditionId &&
+    previousMarket.expiryTs <= Date.now()
+  ) {
+    try {
+      const result = await generateMarketRoundReport(previousMarket);
+      console.log(
+        `[marketDiscovery] ${result.skipped ? 'report already exists' : 'generated report'} ` +
+        `for ${previousMarket.slug} rows=${result.rowCount}`
+      );
+    } catch (err) {
+      console.error(
+        `[marketDiscovery] failed to generate report for ${previousMarket.slug}:`,
+        err
+      );
+    }
+  }
 
   // Persist for cold-start reads and broadcast for live rotation
   const redis = getRedisClient();

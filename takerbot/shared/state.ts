@@ -5,6 +5,7 @@ import type {
   BtcPriceFeed,
   ChainlinkBtcPriceFeed,
   FairValue,
+  MarketReportPoint,
   MarketOrderbookFeed,
   PortfolioPosition,
   PortfolioSnapshot,
@@ -200,6 +201,23 @@ export async function getFairValue(marketId: string): Promise<FairValue | null> 
   return raw ? (JSON.parse(raw) as FairValue) : null;
 }
 
+const MARKET_REPORT_TTL_SECONDS = 7 * 24 * 60 * 60;
+const MARKET_REPORT_MAX_ROWS = 5_000;
+
+export async function appendMarketReportRow(row: MarketReportPoint): Promise<void> {
+  const redis = getRedisClient();
+  const key = REDIS_KEYS.marketReportRows(row.marketId);
+  await redis.lpush(key, JSON.stringify(row));
+  await redis.ltrim(key, 0, MARKET_REPORT_MAX_ROWS - 1);
+  await redis.expire(key, MARKET_REPORT_TTL_SECONDS);
+}
+
+export async function getMarketReportRows(marketId: string): Promise<MarketReportPoint[]> {
+  const redis = getRedisClient();
+  const rawList = await redis.lrange(REDIS_KEYS.marketReportRows(marketId), 0, -1);
+  return rawList.reverse().map((raw) => JSON.parse(raw) as MarketReportPoint);
+}
+
 // ─── Position ─────────────────────────────────────────────────────────────────
 
 export async function setPosition(pos: PortfolioPosition): Promise<void> {
@@ -232,11 +250,26 @@ export async function setActiveMarket(info: ActiveMarketInfo): Promise<void> {
   const redis = getRedisClient();
   // TTL = 30 min (two windows), so a cold-starting process can always find it
   await redis.set(REDIS_KEYS.activeMarket, JSON.stringify(info), 'EX', 1800);
+  await redis.set(REDIS_KEYS.marketInfo(info.conditionId), JSON.stringify(info), 'EX', MARKET_REPORT_TTL_SECONDS);
+  await redis.set(REDIS_KEYS.marketInfoBySlug(info.slug), info.conditionId, 'EX', MARKET_REPORT_TTL_SECONDS);
 }
 
 export async function getActiveMarket(): Promise<ActiveMarketInfo | null> {
   const redis = getRedisClient();
   const raw = await redis.get(REDIS_KEYS.activeMarket);
   return raw ? (JSON.parse(raw) as ActiveMarketInfo) : null;
+}
+
+export async function getMarketInfo(marketId: string): Promise<ActiveMarketInfo | null> {
+  const redis = getRedisClient();
+  const raw = await redis.get(REDIS_KEYS.marketInfo(marketId));
+  return raw ? (JSON.parse(raw) as ActiveMarketInfo) : null;
+}
+
+export async function getMarketInfoBySlug(slug: string): Promise<ActiveMarketInfo | null> {
+  const redis = getRedisClient();
+  const marketId = await redis.get(REDIS_KEYS.marketInfoBySlug(slug));
+  if (!marketId) return null;
+  return getMarketInfo(marketId);
 }
 
