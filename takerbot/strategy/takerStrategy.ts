@@ -253,8 +253,8 @@ private async evaluate(fv: FairValue): Promise<void> {
       return false;
     }
   
-    // Fix #2: treat confidence == MIN_CONFIDENCE as "floor hit" (orderbook is stale),
-    // not as a valid trading signal. Only trade when there is genuine confidence above the floor.
+    // Treat confidence == MIN_CONFIDENCE as a floor hit, not as a valid trading signal.
+    // Only trade when there is genuine confidence above the floor.
     if (confidence <= MIN_CONFIDENCE) {
       console.log(`[takerStrategy] low confidence (${(confidence * 100).toFixed(1)}%) — skipping`);
       return false;

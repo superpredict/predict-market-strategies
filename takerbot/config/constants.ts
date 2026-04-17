@@ -18,18 +18,11 @@ export const MAX_EXPOSURE_USDC = 200;
 
 // ─── Fair Value Model ─────────────────────────────────────────────────────────
 
-/**
- * Annualised BTC volatility used in the binary-option FV model.
- *
- *   FV = clamp( N( ln(S/K) / (σ × √T) ), 0.01, 0.99 )
- *
- * where T is time-to-expiry in years and N is the standard-normal CDF.
- * The model naturally converges to 0 or 1 as T → 0, matching the market.
- *
- * Calibrated from live order-book data (15-min BTC windows, April 2026):
- *   σ = 30 % annualised → N(1.42) ≈ 0.922 at tte=278 s, +0.13 % above strike
- */
-export const BTC_SIGMA_ANNUAL = 0.30;
+/** EWMA decay factor for BTC volatility estimation from Chainlink tick data. */
+export const VOLATILITY_EWMA_LAMBDA = 0.94;
+
+/** Minimum tick count before the per-second EWMA sigma is considered usable. */
+export const VOLATILITY_MIN_TICKS = 5;
 
 /** Minimum model confidence (0–1) required to trade. */
 export const MIN_CONFIDENCE = 0.18;

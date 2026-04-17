@@ -95,14 +95,29 @@ price is published inside `ActiveMarketInfo.strikePrice`, and `fairValueUpdater`
 directly.
 
 ```
-FV = clamp( N( ln(S / K) / (σ × √T) ), 0.01, 0.99 )
+FV = clamp( N(d2), 0.01, 0.99 )
+
+d2 = [ln(S / K) - (σ² / 2) × T] / (σ × √T)
 
 S = current BTC price (Chainlink BTC/USD)
 K = strike price (Vatic active target price for the window)
-T = time-to-expiry in years
-σ = BTC_SIGMA_ANNUAL
+T = time-to-expiry in seconds
+σ = per-second BTC volatility from EWMA
 N = standard normal CDF
 ```
+
+`fairValueUpdater` estimates `σ` dynamically from the Chainlink tick stream using
+an exponentially weighted moving average:
+
+```
+r_t = ln(S_t / S_{t-1})
+σ²_t = λ × σ²_{t-1} + (1 - λ) × (r_t² / Δt)
+```
+
+where `Δt` is measured in seconds, so the resulting sigma is already in
+per-second units and can be fed directly into `d2`. On startup, the updater
+warms the EWMA estimator from recent Redis-backed Chainlink price history, then
+keeps updating sigma on each new Chainlink tick.
 
 ### BTC Staleness Guard
 
@@ -113,7 +128,7 @@ N = standard normal CDF
 if (Date.now() − btcFeed.ts) > BTC_STALE_FORBID_MS → return immediately
 ```
 
-Confidence therefore only reflects **orderbook freshness** and **time-to-expiry**.
+Confidence therefore only reflects **time-to-expiry**.
 
 ### No-Strike Guard
 
@@ -143,7 +158,8 @@ SELL when  marketBid  >  FV + edgeThreshold   (market overpriced)
 
 | Constant | Default | Description |
 |---|---|---|
-| `FV_SCALE` | `5` | Sensitivity: 1% distance from strike → ±0.05 FV |
+| `VOLATILITY_EWMA_LAMBDA` | `0.94` | EWMA decay factor for per-second BTC volatility estimation |
+| `VOLATILITY_MIN_TICKS` | `5` | Minimum Chainlink ticks required before sigma is treated as ready |
 | `BTC_STALE_FORBID_MS` | `30_000` (30 s) | Hard-forbid trading when Chainlink BTC feed is older than this |
 | `MIN_CONFIDENCE` | `0.18` | Minimum model confidence (0–1) required to trade |
 | `STOP_TRADING_BEFORE_EXPIRY_MS` | `60_000` (60 s) | Halt trading this far before expiry |
@@ -172,7 +188,9 @@ takerbot/
 ├── shared/
 │   ├── types.ts              Shared types + Redis key/channel constants
 │   ├── redis.ts              ioredis client factory (client + subscriber)
-│   └── state.ts              Typed get/set helpers for Redis
+│   ├── state.ts              Typed get/set helpers for Redis
+│   ├── fairValueMath.ts      Black-Scholes p_base fair value helpers
+│   └── ewmaVolatility.ts     Per-second EWMA sigma estimator from Chainlink ticks
 ├── feeders/
 │   ├── btcPriceFeeder.ts        Binance bookTicker WS → Redis
 │   ├── chainlinkPriceFeeder.ts  Polymarket Chainlink WS → BTC/USD snapshots + history
