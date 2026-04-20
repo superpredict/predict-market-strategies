@@ -2,7 +2,17 @@ import { access, mkdir, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { resolve } from 'node:path';
 import type { ActiveMarketInfo, MarketReportPoint } from '../shared/types.js';
+import {
+  annualizedVolatilityFromPerSecond,
+  computeBaseFairValue,
+  perSecondVolatilityFromAnnual,
+} from '../shared/fairValueMath.js';
 import { getMarketReportRows } from '../shared/state.js';
+
+/** Fair value using fixed 40% annualized BTC volatility (comparison baseline). */
+const FIXED_ANNUAL_VOLATILITY = 0.4;
+const FIXED_ANNUAL_VOLATILITY_LABEL = `${(FIXED_ANNUAL_VOLATILITY * 100).toFixed(0)}%`;
+const PER_SECOND_FIXED_ANNUAL_VOLATILITY = perSecondVolatilityFromAnnual(FIXED_ANNUAL_VOLATILITY);
 
 const REPORTS_DIR = resolve(process.cwd(), 'takerbot', 'reports');
 
@@ -19,6 +29,10 @@ interface ComputedReportRow extends MarketReportPoint {
   isoTime: string;
   chainlinkPrice: number;
   yesTokenPrice: number;
+  /** sigma * sqrt(60*60*24*365) — annualized EWMA volatility (fractional, e.g. 0.65 ≈ 65%). */
+  annualizedSigma: number | null;
+  /** Same Black–Scholes binary call as fair_value, but σ = 40% annualized. */
+  fairValue40pctAnnual: number | null;
   f: number;
   g: number | null;
   fMinusG: number | null;
@@ -57,12 +71,26 @@ function computeRows(rows: MarketReportPoint[]): ComputedReportRow[] {
     const g = fWindow.length === 5 ? fWindow.reduce((sum, value) => sum + value, 0) / 5 : null;
     const fMinusG = g === null ? null : f - g;
 
+    const annualizedSigma =
+      row.sigma !== null && row.sigma > 0 ? annualizedVolatilityFromPerSecond(row.sigma) : null;
+    const fairValue40pctAnnual =
+      row.strikePrice !== null && row.strikePrice > 0 && row.btcPrice > 0
+        ? computeBaseFairValue({
+            currentPrice: row.btcPrice,
+            strikePrice: row.strikePrice,
+            timeToExpiryMs: row.timeToExpiryMs,
+            perSecondVolatility: PER_SECOND_FIXED_ANNUAL_VOLATILITY,
+          })
+        : null;
+
     computed.push({
       ...row,
       sigma: row.sigma ?? null,
       isoTime: new Date(row.ts).toISOString(),
       chainlinkPrice: row.btcPrice,
       yesTokenPrice,
+      annualizedSigma,
+      fairValue40pctAnnual,
       f,
       g,
       fMinusG,
@@ -81,6 +109,12 @@ function computeSummary(rows: ComputedReportRow[]) {
       avgSigma: null,
       minSigma: null,
       maxSigma: null,
+      avgAnnualizedSigma: null,
+      minAnnualizedSigma: null,
+      maxAnnualizedSigma: null,
+      avgFairValue40pctAnnual: null,
+      minFairValue40pctAnnual: null,
+      maxFairValue40pctAnnual: null,
       avgResidual: null,
       minResidual: null,
       maxResidual: null,
@@ -90,6 +124,12 @@ function computeSummary(rows: ComputedReportRow[]) {
   const fValues = rows.map((row) => row.f);
   const sigmaValues = rows
     .map((row) => row.sigma)
+    .filter((value): value is number => value !== null);
+  const annualizedSigmaValues = rows
+    .map((row) => row.annualizedSigma)
+    .filter((value): value is number => value !== null);
+  const fairValue40Values = rows
+    .map((row) => row.fairValue40pctAnnual)
     .filter((value): value is number => value !== null);
   const residuals = rows
     .map((row) => row.fMinusG)
@@ -105,6 +145,16 @@ function computeSummary(rows: ComputedReportRow[]) {
     avgSigma: average(sigmaValues),
     minSigma: sigmaValues.length > 0 ? Math.min(...sigmaValues) : null,
     maxSigma: sigmaValues.length > 0 ? Math.max(...sigmaValues) : null,
+    avgAnnualizedSigma: average(annualizedSigmaValues),
+    minAnnualizedSigma:
+      annualizedSigmaValues.length > 0 ? Math.min(...annualizedSigmaValues) : null,
+    maxAnnualizedSigma:
+      annualizedSigmaValues.length > 0 ? Math.max(...annualizedSigmaValues) : null,
+    avgFairValue40pctAnnual: average(fairValue40Values),
+    minFairValue40pctAnnual:
+      fairValue40Values.length > 0 ? Math.min(...fairValue40Values) : null,
+    maxFairValue40pctAnnual:
+      fairValue40Values.length > 0 ? Math.max(...fairValue40Values) : null,
     avgResidual: average(residuals),
     minResidual: residuals.length > 0 ? Math.min(...residuals) : null,
     maxResidual: residuals.length > 0 ? Math.max(...residuals) : null,
@@ -119,6 +169,8 @@ function toCsv(rows: ComputedReportRow[]): string {
     'fair_value',
     'confidence',
     'sigma',
+    'annualized_sigma',
+    'fair_value_40pct_annual',
     'chainlink_price',
     'btc_price',
     'strike_price',
@@ -142,6 +194,8 @@ function toCsv(rows: ComputedReportRow[]): string {
       formatNum(row.fairValue),
       formatNum(row.confidence),
       formatMaybeNumber(row.sigma),
+      formatMaybeNumber(row.annualizedSigma),
+      formatMaybeNumber(row.fairValue40pctAnnual),
       formatNum(row.chainlinkPrice, 2),
       formatNum(row.btcPrice, 2),
       formatMaybeNumber(row.strikePrice, 2),
@@ -183,6 +237,12 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('- `chainlink price(t)` is the Chainlink BTC/USD spot used by the fair value model.');
   lines.push('- `yes token price(t)` uses `yes ask`.');
   lines.push('- `sigma(t)` is the per-second EWMA volatility used by the fair value model.');
+  lines.push(
+    '- `annualized_sigma(t) = sigma(t) * sqrt(60*60*24*365)` — same EWMA σ expressed as annualized fraction (e.g. 0.40 = 40%).',
+  );
+  lines.push(
+    `- \`fair_value_40pct_annual\` is the binary-call fair value using a fixed **${FIXED_ANNUAL_VOLATILITY_LABEL} annualized** BTC volatility (for comparison when EWMA σ drifts).`,
+  );
   lines.push('- `f(t) = fair value(t) - yes token price(t)`.');
   lines.push('- `g(t)` is the 5-point moving average of `f(t)` and is blank until 5 samples exist.');
   lines.push('');
@@ -196,20 +256,35 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push(`- avg sigma(t): ${formatMaybeNumber(summary.avgSigma) || 'N/A'}`);
   lines.push(`- min sigma(t): ${formatMaybeNumber(summary.minSigma) || 'N/A'}`);
   lines.push(`- max sigma(t): ${formatMaybeNumber(summary.maxSigma) || 'N/A'}`);
+  lines.push(`- avg annualized_sigma(t): ${formatMaybeNumber(summary.avgAnnualizedSigma) || 'N/A'}`);
+  lines.push(`- min annualized_sigma(t): ${formatMaybeNumber(summary.minAnnualizedSigma) || 'N/A'}`);
+  lines.push(`- max annualized_sigma(t): ${formatMaybeNumber(summary.maxAnnualizedSigma) || 'N/A'}`);
+  lines.push(
+    `- avg fair_value_40pct_annual: ${formatMaybeNumber(summary.avgFairValue40pctAnnual) || 'N/A'}`,
+  );
+  lines.push(
+    `- min fair_value_40pct_annual: ${formatMaybeNumber(summary.minFairValue40pctAnnual) || 'N/A'}`,
+  );
+  lines.push(
+    `- max fair_value_40pct_annual: ${formatMaybeNumber(summary.maxFairValue40pctAnnual) || 'N/A'}`,
+  );
   lines.push(`- avg f(t)-g(t): ${formatMaybeNumber(summary.avgResidual) || 'N/A'}`);
   lines.push(`- min f(t)-g(t): ${formatMaybeNumber(summary.minResidual) || 'N/A'}`);
   lines.push(`- max f(t)-g(t): ${formatMaybeNumber(summary.maxResidual) || 'N/A'}`);
   lines.push('');
   lines.push('## Rows');
   lines.push('');
-  lines.push('| time | fair value | sigma | chainlink price | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f(t)-g(t) |');
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  lines.push(
+    '| time | fair value | sigma | annualized σ | fv 40% ann | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f-g |',
+  );
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
 
   for (const row of rows) {
     lines.push(
-      `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.sigma)} | ${formatNum(row.chainlinkPrice, 2)} | ` +
-        `${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ${formatNum(row.noBid)} | ` +
-        `${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
+      `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.sigma)} | ` +
+        `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.fairValue40pctAnnual)} | ` +
+        `${formatNum(row.chainlinkPrice, 2)} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
+        `${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
         `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} |`,
     );
   }

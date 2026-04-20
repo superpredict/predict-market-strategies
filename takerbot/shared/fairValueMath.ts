@@ -13,6 +13,23 @@
  * where sigma is BTC volatility in per-second units and T is expressed in
  * seconds.
  */
+
+/** Calendar seconds per year (365 days), for annualizing per-second sigma. */
+export const SECONDS_PER_YEAR = 60 * 60 * 24 * 365;
+
+/**
+ * Convert EWMA per-second volatility to annualized (fractional) volatility.
+ * annualized_sigma = sigma_per_second * sqrt(seconds_per_year)
+ */
+export function annualizedVolatilityFromPerSecond(perSecond: number): number {
+  return perSecond * Math.sqrt(SECONDS_PER_YEAR);
+}
+
+/** Convert annualized fractional volatility (e.g. 0.40 for 40%) to per-second units. */
+export function perSecondVolatilityFromAnnual(annual: number): number {
+  return annual / Math.sqrt(SECONDS_PER_YEAR);
+}
+
 const MIN_PROBABILITY = 0.01;
 const MAX_PROBABILITY = 0.99;
 
