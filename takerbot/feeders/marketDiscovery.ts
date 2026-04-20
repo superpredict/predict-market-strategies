@@ -29,8 +29,12 @@ dotenv.config();
 
 const GAMMA_API_BASE = 'https://gamma-api.polymarket.com';
 const VATIC_TARGETS_URL = 'https://api.vatic.trading/api/v1/targets/active?asset=btc&types=15min';
+const DERIBIT_TICKER_URL = 'https://www.deribit.com/api/v2/public/ticker';
 const SLUG_PREFIX = 'btc-updown-15m';
 const WINDOW_SECONDS = 900; // 15 minutes
+const STRIKE_ROUNDING_USD = 1000;
+
+const DERIBIT_MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'] as const;
 
 // ─── Gamma API response shape (fields we care about) ─────────────────────────
 
@@ -59,11 +63,79 @@ interface VaticTargetsResponse {
   results: VaticTarget[];
 }
 
+interface DeribitTickerResponse {
+  jsonrpc: string;
+  result?: {
+    mark_iv?: number;
+  };
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Unix timestamp (seconds) for the start of the current 15-min window. */
 function currentWindowTimestamp(): number {
   return Math.floor(Date.now() / 1000 / WINDOW_SECONDS) * WINDOW_SECONDS;
+}
+
+function getWeekStartMonday(date: Date): Date {
+  const clone = new Date(date);
+  clone.setHours(0, 0, 0, 0);
+  const day = clone.getDay(); // Sunday=0 ... Saturday=6
+  const daysSinceMonday = (day + 6) % 7;
+  clone.setDate(clone.getDate() - daysSinceMonday);
+  return clone;
+}
+
+/** "下下個禮拜五": Friday in the week after next. */
+function getFridayAfterNext(reference: Date): Date {
+  const monday = getWeekStartMonday(reference);
+  const result = new Date(monday);
+  result.setDate(monday.getDate() + 18); // Monday + (2 weeks + Friday offset 4)
+  return result;
+}
+
+function formatDeribitExpiry(date: Date): string {
+  const day = date.getDate();
+  const month = DERIBIT_MONTHS[date.getMonth()];
+  const yearTwoDigits = (date.getFullYear() % 100).toString().padStart(2, '0');
+  return `${day}${month}${yearTwoDigits}`;
+}
+
+function buildDeribitInstrumentName(strikePrice: number): string {
+  const targetDate = getFridayAfterNext(new Date());
+  const expiry = formatDeribitExpiry(targetDate);
+  const roundedStrike = Math.max(
+    STRIKE_ROUNDING_USD,
+    Math.round(strikePrice / STRIKE_ROUNDING_USD) * STRIKE_ROUNDING_USD,
+  );
+  return `BTC-${expiry}-${roundedStrike}-C`;
+}
+
+async function fetchDeribitMarkIvAnnual(
+  strikePrice: number | null,
+): Promise<{ instrumentName: string | null; annualVolatility: number | null }> {
+  if (strikePrice === null || !Number.isFinite(strikePrice) || strikePrice <= 0) {
+    return { instrumentName: null, annualVolatility: null };
+  }
+
+  const instrumentName = buildDeribitInstrumentName(strikePrice);
+  const url = `${DERIBIT_TICKER_URL}?instrument_name=${encodeURIComponent(instrumentName)}`;
+
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`Deribit API ${res.status}: ${res.statusText} for ${url}`);
+  }
+
+  const body = (await res.json()) as DeribitTickerResponse;
+  const markIv = body.result?.mark_iv;
+  if (typeof markIv !== 'number' || !Number.isFinite(markIv) || markIv <= 0) {
+    console.warn(
+      `[marketDiscovery] invalid Deribit mark_iv for ${instrumentName}: ${String(markIv)}`
+    );
+    return { instrumentName, annualVolatility: null };
+  }
+
+  return { instrumentName, annualVolatility: markIv / 100 };
 }
 
 async function fetchMarketBySlug(slug: string): Promise<GammaMarketResponse | null> {
@@ -157,6 +229,15 @@ async function checkAndPublish(): Promise<void> {
 
   // ── Strike price: Vatic active target for the detected 15-min window ──────
   const strikePrice = await fetchStrikePrice(windowTs);
+  let deribitInstrumentName: string | null = null;
+  let deribitMarkIvAnnual: number | null = null;
+  try {
+    const deribit = await fetchDeribitMarkIvAnnual(strikePrice);
+    deribitInstrumentName = deribit.instrumentName;
+    deribitMarkIvAnnual = deribit.annualVolatility;
+  } catch (err) {
+    console.error('[marketDiscovery] Deribit ticker error:', err);
+  }
 
   const info: ActiveMarketInfo = {
     conditionId: market.conditionId,
@@ -164,6 +245,8 @@ async function checkAndPublish(): Promise<void> {
     yesTokenId: tokenIds[0]!,
     noTokenId: tokenIds[1]!,
     strikePrice,
+    deribitMarkIvAnnual,
+    deribitInstrumentName,
     endDate: market.endDate,
     expiryTs: new Date(market.endDate).getTime(),
     slug: market.slug,
@@ -201,6 +284,10 @@ async function checkAndPublish(): Promise<void> {
     info.strikePrice !== null
       ? `$${info.strikePrice.toLocaleString()} (vatic active target)`
       : 'N/A — Vatic target unavailable';
+  const deribitLine =
+    info.deribitMarkIvAnnual !== null
+      ? `${(info.deribitMarkIvAnnual * 100).toFixed(2)}% (${info.deribitInstrumentName})`
+      : `N/A${info.deribitInstrumentName ? ` (${info.deribitInstrumentName})` : ''}`;
 
   console.log(
     `[marketDiscovery] published market` +
@@ -208,7 +295,8 @@ async function checkAndPublish(): Promise<void> {
     `\n  question    : ${info.question}` +
     `\n  yesTokenId  : ${info.yesTokenId.slice(0, 16)}…` +
     `\n  expiry      : ${info.endDate}` +
-    `\n  strikePrice : ${strikeLine}`
+    `\n  strikePrice : ${strikeLine}` +
+    `\n  deribit iv : ${deribitLine}`
   );
 }
 

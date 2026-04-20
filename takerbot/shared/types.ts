@@ -93,6 +93,10 @@ export interface ActiveMarketInfo {
   noTokenId: string;
   /** Strike price in USD — Vatic active target for this window; null if unavailable */
   strikePrice: number | null;
+  /** Deribit mark IV as annualized fractional volatility (e.g. 0.4115 = 41.15%). */
+  deribitMarkIvAnnual: number | null;
+  /** Deribit option instrument used to source mark IV, e.g. BTC-8MAY26-76000-C. */
+  deribitInstrumentName: string | null;
   /** ISO-8601 end date string */
   endDate: string;
   /** End date as epoch ms */

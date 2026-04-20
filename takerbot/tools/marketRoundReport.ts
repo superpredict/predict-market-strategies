@@ -9,11 +9,6 @@ import {
 } from '../shared/fairValueMath.js';
 import { getMarketReportRows } from '../shared/state.js';
 
-/** Fair value using fixed 40% annualized BTC volatility (comparison baseline). */
-const FIXED_ANNUAL_VOLATILITY = 0.4;
-const FIXED_ANNUAL_VOLATILITY_LABEL = `${(FIXED_ANNUAL_VOLATILITY * 100).toFixed(0)}%`;
-const PER_SECOND_FIXED_ANNUAL_VOLATILITY = perSecondVolatilityFromAnnual(FIXED_ANNUAL_VOLATILITY);
-
 const REPORTS_DIR = resolve(process.cwd(), 'takerbot', 'reports');
 
 export interface GeneratedMarketReport {
@@ -31,8 +26,8 @@ interface ComputedReportRow extends MarketReportPoint {
   yesTokenPrice: number;
   /** sigma * sqrt(60*60*24*365) — annualized EWMA volatility (fractional, e.g. 0.65 ≈ 65%). */
   annualizedSigma: number | null;
-  /** Same Black–Scholes binary call as fair_value, but σ = 40% annualized. */
-  fairValue40pctAnnual: number | null;
+  /** Same Black–Scholes binary call as fair_value, but σ = Deribit mark_iv annualized. */
+  fairValueDeribitIv: number | null;
   f: number;
   g: number | null;
   fMinusG: number | null;
@@ -58,9 +53,14 @@ function fileExists(path: string): Promise<boolean> {
   );
 }
 
-function computeRows(rows: MarketReportPoint[]): ComputedReportRow[] {
+function computeRows(
+  rows: MarketReportPoint[],
+  deribitAnnualVolatility: number | null,
+): ComputedReportRow[] {
   const computed: ComputedReportRow[] = [];
   const fWindow: number[] = [];
+  const perSecondDeribitVolatility =
+    deribitAnnualVolatility !== null ? perSecondVolatilityFromAnnual(deribitAnnualVolatility) : null;
 
   for (const row of rows) {
     const yesTokenPrice = row.yesAsk;
@@ -73,13 +73,16 @@ function computeRows(rows: MarketReportPoint[]): ComputedReportRow[] {
 
     const annualizedSigma =
       row.sigma !== null && row.sigma > 0 ? annualizedVolatilityFromPerSecond(row.sigma) : null;
-    const fairValue40pctAnnual =
-      row.strikePrice !== null && row.strikePrice > 0 && row.btcPrice > 0
+    const fairValueDeribitIv =
+      perSecondDeribitVolatility !== null &&
+      row.strikePrice !== null &&
+      row.strikePrice > 0 &&
+      row.btcPrice > 0
         ? computeBaseFairValue({
             currentPrice: row.btcPrice,
             strikePrice: row.strikePrice,
             timeToExpiryMs: row.timeToExpiryMs,
-            perSecondVolatility: PER_SECOND_FIXED_ANNUAL_VOLATILITY,
+            perSecondVolatility: perSecondDeribitVolatility,
           })
         : null;
 
@@ -90,7 +93,7 @@ function computeRows(rows: MarketReportPoint[]): ComputedReportRow[] {
       chainlinkPrice: row.btcPrice,
       yesTokenPrice,
       annualizedSigma,
-      fairValue40pctAnnual,
+      fairValueDeribitIv,
       f,
       g,
       fMinusG,
@@ -112,9 +115,9 @@ function computeSummary(rows: ComputedReportRow[]) {
       avgAnnualizedSigma: null,
       minAnnualizedSigma: null,
       maxAnnualizedSigma: null,
-      avgFairValue40pctAnnual: null,
-      minFairValue40pctAnnual: null,
-      maxFairValue40pctAnnual: null,
+      avgFairValueDeribitIv: null,
+      minFairValueDeribitIv: null,
+      maxFairValueDeribitIv: null,
       avgResidual: null,
       minResidual: null,
       maxResidual: null,
@@ -128,8 +131,8 @@ function computeSummary(rows: ComputedReportRow[]) {
   const annualizedSigmaValues = rows
     .map((row) => row.annualizedSigma)
     .filter((value): value is number => value !== null);
-  const fairValue40Values = rows
-    .map((row) => row.fairValue40pctAnnual)
+  const fairValueDeribitValues = rows
+    .map((row) => row.fairValueDeribitIv)
     .filter((value): value is number => value !== null);
   const residuals = rows
     .map((row) => row.fMinusG)
@@ -150,11 +153,11 @@ function computeSummary(rows: ComputedReportRow[]) {
       annualizedSigmaValues.length > 0 ? Math.min(...annualizedSigmaValues) : null,
     maxAnnualizedSigma:
       annualizedSigmaValues.length > 0 ? Math.max(...annualizedSigmaValues) : null,
-    avgFairValue40pctAnnual: average(fairValue40Values),
-    minFairValue40pctAnnual:
-      fairValue40Values.length > 0 ? Math.min(...fairValue40Values) : null,
-    maxFairValue40pctAnnual:
-      fairValue40Values.length > 0 ? Math.max(...fairValue40Values) : null,
+    avgFairValueDeribitIv: average(fairValueDeribitValues),
+    minFairValueDeribitIv:
+      fairValueDeribitValues.length > 0 ? Math.min(...fairValueDeribitValues) : null,
+    maxFairValueDeribitIv:
+      fairValueDeribitValues.length > 0 ? Math.max(...fairValueDeribitValues) : null,
     avgResidual: average(residuals),
     minResidual: residuals.length > 0 ? Math.min(...residuals) : null,
     maxResidual: residuals.length > 0 ? Math.max(...residuals) : null,
@@ -170,7 +173,7 @@ function toCsv(rows: ComputedReportRow[]): string {
     'confidence',
     'sigma',
     'annualized_sigma',
-    'fair_value_40pct_annual',
+    'fair_value_deribit_iv',
     'chainlink_price',
     'btc_price',
     'strike_price',
@@ -195,7 +198,7 @@ function toCsv(rows: ComputedReportRow[]): string {
       formatNum(row.confidence),
       formatMaybeNumber(row.sigma),
       formatMaybeNumber(row.annualizedSigma),
-      formatMaybeNumber(row.fairValue40pctAnnual),
+      formatMaybeNumber(row.fairValueDeribitIv),
       formatNum(row.chainlinkPrice, 2),
       formatNum(row.btcPrice, 2),
       formatMaybeNumber(row.strikePrice, 2),
@@ -220,6 +223,11 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   const firstRow = rows[0] ?? null;
   const lastRow = rows[rows.length - 1] ?? null;
   const relativeCsvPath = csvPath.replace(`${process.cwd()}/`, '');
+  const deribitInstrumentName = typeof market.deribitInstrumentName === 'string' ? market.deribitInstrumentName : null;
+  const deribitMarkIvAnnual =
+    typeof market.deribitMarkIvAnnual === 'number' && Number.isFinite(market.deribitMarkIvAnnual)
+      ? market.deribitMarkIvAnnual
+      : null;
 
   const lines: string[] = [];
   lines.push(`# Market Round Report: ${market.slug}`);
@@ -229,6 +237,14 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push(`- slug: \`${market.slug}\``);
   lines.push(`- expiry: ${market.endDate}`);
   lines.push(`- strikePrice: ${market.strikePrice === null ? 'N/A' : `$${market.strikePrice.toFixed(2)}`}`);
+  lines.push(
+    `- deribitInstrument: ${deribitInstrumentName ? `\`${deribitInstrumentName}\`` : 'N/A'}`
+  );
+  lines.push(
+    `- deribitMarkIv: ${
+      deribitMarkIvAnnual === null ? 'N/A' : `${(deribitMarkIvAnnual * 100).toFixed(2)}%`
+    }`
+  );
   lines.push(`- rows: ${rows.length}`);
   lines.push(`- csv: \`${relativeCsvPath}\``);
   lines.push('');
@@ -241,7 +257,7 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
     '- `annualized_sigma(t) = sigma(t) * sqrt(60*60*24*365)` — same EWMA σ expressed as annualized fraction (e.g. 0.40 = 40%).',
   );
   lines.push(
-    `- \`fair_value_40pct_annual\` is the binary-call fair value using a fixed **${FIXED_ANNUAL_VOLATILITY_LABEL} annualized** BTC volatility (for comparison when EWMA σ drifts).`,
+    '- `fair_value_deribit_iv` is the binary-call fair value using Deribit `mark_iv` annualized volatility from market discovery.',
   );
   lines.push('- `f(t) = fair value(t) - yes token price(t)`.');
   lines.push('- `g(t)` is the 5-point moving average of `f(t)` and is blank until 5 samples exist.');
@@ -259,15 +275,9 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push(`- avg annualized_sigma(t): ${formatMaybeNumber(summary.avgAnnualizedSigma) || 'N/A'}`);
   lines.push(`- min annualized_sigma(t): ${formatMaybeNumber(summary.minAnnualizedSigma) || 'N/A'}`);
   lines.push(`- max annualized_sigma(t): ${formatMaybeNumber(summary.maxAnnualizedSigma) || 'N/A'}`);
-  lines.push(
-    `- avg fair_value_40pct_annual: ${formatMaybeNumber(summary.avgFairValue40pctAnnual) || 'N/A'}`,
-  );
-  lines.push(
-    `- min fair_value_40pct_annual: ${formatMaybeNumber(summary.minFairValue40pctAnnual) || 'N/A'}`,
-  );
-  lines.push(
-    `- max fair_value_40pct_annual: ${formatMaybeNumber(summary.maxFairValue40pctAnnual) || 'N/A'}`,
-  );
+  lines.push(`- avg fair_value_deribit_iv: ${formatMaybeNumber(summary.avgFairValueDeribitIv) || 'N/A'}`);
+  lines.push(`- min fair_value_deribit_iv: ${formatMaybeNumber(summary.minFairValueDeribitIv) || 'N/A'}`);
+  lines.push(`- max fair_value_deribit_iv: ${formatMaybeNumber(summary.maxFairValueDeribitIv) || 'N/A'}`);
   lines.push(`- avg f(t)-g(t): ${formatMaybeNumber(summary.avgResidual) || 'N/A'}`);
   lines.push(`- min f(t)-g(t): ${formatMaybeNumber(summary.minResidual) || 'N/A'}`);
   lines.push(`- max f(t)-g(t): ${formatMaybeNumber(summary.maxResidual) || 'N/A'}`);
@@ -275,14 +285,14 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('## Rows');
   lines.push('');
   lines.push(
-    '| time | fair value | sigma | annualized σ | fv 40% ann | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f-g |',
+    '| time | fair value | sigma | annualized σ | fv deribit iv | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f-g |',
   );
   lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
 
   for (const row of rows) {
     lines.push(
       `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.sigma)} | ` +
-        `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.fairValue40pctAnnual)} | ` +
+        `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
         `${formatNum(row.chainlinkPrice, 2)} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
         `${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
         `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} |`,
@@ -316,7 +326,11 @@ export async function generateMarketRoundReport(
     }
   }
 
-  const rows = computeRows(await getMarketReportRows(market.conditionId));
+  const deribitMarkIvAnnual =
+    typeof market.deribitMarkIvAnnual === 'number' && Number.isFinite(market.deribitMarkIvAnnual)
+      ? market.deribitMarkIvAnnual
+      : null;
+  const rows = computeRows(await getMarketReportRows(market.conditionId), deribitMarkIvAnnual);
   const markdown = toMarkdown(market, rows, csvPath);
   const csv = toCsv(rows);
 
