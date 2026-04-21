@@ -12,6 +12,7 @@
     "takerbot:chainlinkFeeder": "tsx takerbot/feeders/chainlinkPriceFeeder.ts",
     "takerbot:priceReport": "tsx takerbot/tools/priceFeedPairReport.ts",
     "takerbot:marketRoundReport": "tsx takerbot/tools/generateMarketRoundReport.ts",
+    "takerbot:reportBacktest": "node --import tsx/esm takerbot/tools/backtestReportSignals.ts",
     "takerbot:marketFeeder": "tsx takerbot/feeders/marketPriceFeeder.ts",
     "takerbot:fvUpdater": "tsx takerbot/updater/fairValueUpdater.ts",
     "takerbot:portfolio": "tsx takerbot/portfolio/portfolioTracker.ts",
