@@ -33,9 +33,18 @@ interface ComputedReportRow extends MarketReportPoint {
    * converted to per-second for Black–Scholes (same contract as fair_value / fair_value_deribit_iv).
    */
   fairValueBlendedSigma: number | null;
+  /** f/g/f−g from self EWMA fair value (a). */
   f: number;
   g: number | null;
   fMinusG: number | null;
+  /** f/g/f−g from Deribit IV fair value (b). */
+  fDeribitIv: number | null;
+  gDeribitIv: number | null;
+  fMinusGDeribitIv: number | null;
+  /** f/g/f−g from blended σ (mean EWMA + Deribit) fair value (c). */
+  fMeanFv: number | null;
+  gMeanFv: number | null;
+  fMinusGMeanFv: number | null;
 }
 
 /** When both are present, annual σ is averaged then converted to per-second; otherwise the sole source. */
@@ -74,12 +83,31 @@ function fileExists(path: string): Promise<boolean> {
   );
 }
 
+/**
+ * Same 5-point MA as primary f/g, but clears the window when the current f is null (no Deribit / blended FV).
+ */
+function rollingGForAlternateF(
+  window: number[],
+  fAlt: number | null,
+): { g: number | null; fMinusG: number | null } {
+  if (fAlt === null) {
+    window.length = 0;
+    return { g: null, fMinusG: null };
+  }
+  window.push(fAlt);
+  if (window.length > 5) window.shift();
+  const g = window.length === 5 ? window.reduce((sum, v) => sum + v, 0) / 5 : null;
+  return { g, fMinusG: g === null ? null : fAlt - g };
+}
+
 function computeRows(
   rows: MarketReportPoint[],
   deribitAnnualVolatility: number | null,
 ): ComputedReportRow[] {
   const computed: ComputedReportRow[] = [];
   const fWindow: number[] = [];
+  const fDeribitWindow: number[] = [];
+  const fMeanFvWindow: number[] = [];
   const perSecondDeribitVolatility =
     deribitAnnualVolatility !== null ? perSecondVolatilityFromAnnual(deribitAnnualVolatility) : null;
 
@@ -121,6 +149,17 @@ function computeRows(
           })
         : null;
 
+    const fDeribitIv =
+      fairValueDeribitIv !== null ? fairValueDeribitIv - yesTokenPrice : null;
+    const { g: gDeribitIv, fMinusG: fMinusGDeribitIv } = rollingGForAlternateF(
+      fDeribitWindow,
+      fDeribitIv,
+    );
+
+    const fMeanFv =
+      fairValueBlendedSigma !== null ? fairValueBlendedSigma - yesTokenPrice : null;
+    const { g: gMeanFv, fMinusG: fMinusGMeanFv } = rollingGForAlternateF(fMeanFvWindow, fMeanFv);
+
     computed.push({
       ...row,
       sigma: row.sigma ?? null,
@@ -133,6 +172,12 @@ function computeRows(
       f,
       g,
       fMinusG,
+      fDeribitIv,
+      gDeribitIv,
+      fMinusGDeribitIv,
+      fMeanFv,
+      gMeanFv,
+      fMinusGMeanFv,
     });
   }
 
@@ -157,6 +202,18 @@ function computeSummary(rows: ComputedReportRow[]) {
       avgResidual: null,
       minResidual: null,
       maxResidual: null,
+      avgFDeribitIv: null,
+      minFDeribitIv: null,
+      maxFDeribitIv: null,
+      avgResidualDeribitIv: null,
+      minResidualDeribitIv: null,
+      maxResidualDeribitIv: null,
+      avgFMeanFv: null,
+      minFMeanFv: null,
+      maxFMeanFv: null,
+      avgResidualMeanFv: null,
+      minResidualMeanFv: null,
+      maxResidualMeanFv: null,
     };
   }
 
@@ -172,6 +229,18 @@ function computeSummary(rows: ComputedReportRow[]) {
     .filter((value): value is number => value !== null);
   const residuals = rows
     .map((row) => row.fMinusG)
+    .filter((value): value is number => value !== null);
+  const fDeribitIvValues = rows
+    .map((row) => row.fDeribitIv)
+    .filter((value): value is number => value !== null);
+  const residualsDeribitIv = rows
+    .map((row) => row.fMinusGDeribitIv)
+    .filter((value): value is number => value !== null);
+  const fMeanFvValues = rows
+    .map((row) => row.fMeanFv)
+    .filter((value): value is number => value !== null);
+  const residualsMeanFv = rows
+    .map((row) => row.fMinusGMeanFv)
     .filter((value): value is number => value !== null);
 
   const average = (values: number[]) =>
@@ -199,6 +268,20 @@ function computeSummary(rows: ComputedReportRow[]) {
     avgResidual: average(residuals),
     minResidual: residuals.length > 0 ? Math.min(...residuals) : null,
     maxResidual: residuals.length > 0 ? Math.max(...residuals) : null,
+    avgFDeribitIv: average(fDeribitIvValues),
+    minFDeribitIv: fDeribitIvValues.length > 0 ? Math.min(...fDeribitIvValues) : null,
+    maxFDeribitIv: fDeribitIvValues.length > 0 ? Math.max(...fDeribitIvValues) : null,
+    avgResidualDeribitIv: average(residualsDeribitIv),
+    minResidualDeribitIv:
+      residualsDeribitIv.length > 0 ? Math.min(...residualsDeribitIv) : null,
+    maxResidualDeribitIv:
+      residualsDeribitIv.length > 0 ? Math.max(...residualsDeribitIv) : null,
+    avgFMeanFv: average(fMeanFvValues),
+    minFMeanFv: fMeanFvValues.length > 0 ? Math.min(...fMeanFvValues) : null,
+    maxFMeanFv: fMeanFvValues.length > 0 ? Math.max(...fMeanFvValues) : null,
+    avgResidualMeanFv: average(residualsMeanFv),
+    minResidualMeanFv: residualsMeanFv.length > 0 ? Math.min(...residualsMeanFv) : null,
+    maxResidualMeanFv: residualsMeanFv.length > 0 ? Math.max(...residualsMeanFv) : null,
   };
 }
 
@@ -225,6 +308,12 @@ function toCsv(rows: ComputedReportRow[]): string {
     'f',
     'g',
     'f_minus_g',
+    'f_deribit_iv',
+    'g_deribit_iv',
+    'f_minus_g_deribit_iv',
+    'f_mean_fv',
+    'g_mean_fv',
+    'f_minus_g_mean_fv',
   ];
 
   const lines = rows.map((row) =>
@@ -250,6 +339,12 @@ function toCsv(rows: ComputedReportRow[]): string {
       formatNum(row.f),
       formatMaybeNumber(row.g),
       formatMaybeNumber(row.fMinusG),
+      formatMaybeNumber(row.fDeribitIv),
+      formatMaybeNumber(row.gDeribitIv),
+      formatMaybeNumber(row.fMinusGDeribitIv),
+      formatMaybeNumber(row.fMeanFv),
+      formatMaybeNumber(row.gMeanFv),
+      formatMaybeNumber(row.fMinusGMeanFv),
     ].join(','),
   );
 
@@ -299,8 +394,14 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push(
     '- `fair_value_deribit_iv` is the binary-call fair value using only Deribit `mark_iv` annualized volatility from market discovery.',
   );
-  lines.push('- `f(t) = fair value(t) - yes token price(t)`.');
+  lines.push('- `f(t) = fair value(t) - yes token price(t)` — self EWMA σ fair value (a).');
   lines.push('- `g(t)` is the 5-point moving average of `f(t)` and is blank until 5 samples exist.');
+  lines.push(
+    '- **(b)** `f_deribit_iv` / `g_deribit_iv` / `f_minus_g_deribit_iv` (CSV): same construction as `f`/`g`/`f_minus_g` but `fair_value - yes_ask` uses `fair_value_deribit_iv`. The 5-point `g` window clears after any row where Deribit FV is missing.',
+  );
+  lines.push(
+    '- **(c)** `f_mean_fv` / `g_mean_fv` / `f_minus_g_mean_fv` (CSV): same using `fair_value_blended_sigma` (mean annual σ of EWMA and Deribit, then BS FV). Window clears when blended FV is missing.',
+  );
   lines.push('');
   lines.push('## Summary');
   lines.push('');
@@ -327,13 +428,33 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push(`- avg f(t)-g(t): ${formatMaybeNumber(summary.avgResidual) || 'N/A'}`);
   lines.push(`- min f(t)-g(t): ${formatMaybeNumber(summary.minResidual) || 'N/A'}`);
   lines.push(`- max f(t)-g(t): ${formatMaybeNumber(summary.maxResidual) || 'N/A'}`);
+  lines.push(`- avg f_deribit_iv: ${formatMaybeNumber(summary.avgFDeribitIv) || 'N/A'}`);
+  lines.push(`- min f_deribit_iv: ${formatMaybeNumber(summary.minFDeribitIv) || 'N/A'}`);
+  lines.push(`- max f_deribit_iv: ${formatMaybeNumber(summary.maxFDeribitIv) || 'N/A'}`);
+  lines.push(
+    `- avg f_deribit_iv - g: ${formatMaybeNumber(summary.avgResidualDeribitIv) || 'N/A'}`,
+  );
+  lines.push(
+    `- min f_deribit_iv - g: ${formatMaybeNumber(summary.minResidualDeribitIv) || 'N/A'}`,
+  );
+  lines.push(
+    `- max f_deribit_iv - g: ${formatMaybeNumber(summary.maxResidualDeribitIv) || 'N/A'}`,
+  );
+  lines.push(`- avg f_mean_fv: ${formatMaybeNumber(summary.avgFMeanFv) || 'N/A'}`);
+  lines.push(`- min f_mean_fv: ${formatMaybeNumber(summary.minFMeanFv) || 'N/A'}`);
+  lines.push(`- max f_mean_fv: ${formatMaybeNumber(summary.maxFMeanFv) || 'N/A'}`);
+  lines.push(`- avg f_mean_fv - g: ${formatMaybeNumber(summary.avgResidualMeanFv) || 'N/A'}`);
+  lines.push(`- min f_mean_fv - g: ${formatMaybeNumber(summary.minResidualMeanFv) || 'N/A'}`);
+  lines.push(`- max f_mean_fv - g: ${formatMaybeNumber(summary.maxResidualMeanFv) || 'N/A'}`);
   lines.push('');
   lines.push('## Rows');
   lines.push('');
   lines.push(
-    '| time | fair value | fair value (σ EWMA+Deribit) | annualized σ | fv deribit iv | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f-g |',
+    '| time | fair value | fair value (σ EWMA+Deribit) | annualized σ | fv deribit iv | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f (a) | g (a) | f-g (a) | f (b) | g (b) | f-g (b) | f (c) | g (c) | f-g (c) |',
   );
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  lines.push(
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+  );
 
   for (const row of rows) {
     lines.push(
@@ -341,7 +462,10 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
         `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
         `${formatNum(row.chainlinkPrice, 2)} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
         `${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
-        `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} |`,
+        `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} | ` +
+        `${formatMaybeNumber(row.fDeribitIv)} | ${formatMaybeNumber(row.gDeribitIv)} | ` +
+        `${formatMaybeNumber(row.fMinusGDeribitIv)} | ${formatMaybeNumber(row.fMeanFv)} | ` +
+        `${formatMaybeNumber(row.gMeanFv)} | ${formatMaybeNumber(row.fMinusGMeanFv)} |`,
     );
   }
 
