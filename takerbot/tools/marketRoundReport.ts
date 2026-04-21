@@ -28,9 +28,30 @@ interface ComputedReportRow extends MarketReportPoint {
   annualizedSigma: number | null;
   /** Same Black–Scholes binary call as fair_value, but σ = Deribit mark_iv annualized. */
   fairValueDeribitIv: number | null;
+  /**
+   * Binary fair value with blended σ: annual average of EWMA annualized σ and Deribit mark_iv,
+   * converted to per-second for Black–Scholes (same contract as fair_value / fair_value_deribit_iv).
+   */
+  fairValueBlendedSigma: number | null;
   f: number;
   g: number | null;
   fMinusG: number | null;
+}
+
+/** When both are present, annual σ is averaged then converted to per-second; otherwise the sole source. */
+function blendedPerSecondVolatility(
+  ewmaPerSecond: number | null,
+  deribitAnnual: number | null,
+): number | null {
+  const hasEwma = ewmaPerSecond !== null && ewmaPerSecond > 0;
+  const hasDeribit = deribitAnnual !== null && deribitAnnual > 0 && Number.isFinite(deribitAnnual);
+  if (hasEwma && hasDeribit) {
+    const ewmaAnnual = annualizedVolatilityFromPerSecond(ewmaPerSecond!);
+    return perSecondVolatilityFromAnnual((ewmaAnnual + deribitAnnual!) / 2);
+  }
+  if (hasEwma) return ewmaPerSecond!;
+  if (hasDeribit) return perSecondVolatilityFromAnnual(deribitAnnual!);
+  return null;
 }
 
 function sanitizeFilePart(value: string): string {
@@ -86,6 +107,20 @@ function computeRows(
           })
         : null;
 
+    const blendedPerSecond = blendedPerSecondVolatility(row.sigma, deribitAnnualVolatility);
+    const fairValueBlendedSigma =
+      blendedPerSecond !== null &&
+      row.strikePrice !== null &&
+      row.strikePrice > 0 &&
+      row.btcPrice > 0
+        ? computeBaseFairValue({
+            currentPrice: row.btcPrice,
+            strikePrice: row.strikePrice,
+            timeToExpiryMs: row.timeToExpiryMs,
+            perSecondVolatility: blendedPerSecond,
+          })
+        : null;
+
     computed.push({
       ...row,
       sigma: row.sigma ?? null,
@@ -94,6 +129,7 @@ function computeRows(
       yesTokenPrice,
       annualizedSigma,
       fairValueDeribitIv,
+      fairValueBlendedSigma,
       f,
       g,
       fMinusG,
@@ -109,15 +145,15 @@ function computeSummary(rows: ComputedReportRow[]) {
       avgF: null,
       minF: null,
       maxF: null,
-      avgSigma: null,
-      minSigma: null,
-      maxSigma: null,
       avgAnnualizedSigma: null,
       minAnnualizedSigma: null,
       maxAnnualizedSigma: null,
       avgFairValueDeribitIv: null,
       minFairValueDeribitIv: null,
       maxFairValueDeribitIv: null,
+      avgFairValueBlendedSigma: null,
+      minFairValueBlendedSigma: null,
+      maxFairValueBlendedSigma: null,
       avgResidual: null,
       minResidual: null,
       maxResidual: null,
@@ -125,14 +161,14 @@ function computeSummary(rows: ComputedReportRow[]) {
   }
 
   const fValues = rows.map((row) => row.f);
-  const sigmaValues = rows
-    .map((row) => row.sigma)
-    .filter((value): value is number => value !== null);
   const annualizedSigmaValues = rows
     .map((row) => row.annualizedSigma)
     .filter((value): value is number => value !== null);
   const fairValueDeribitValues = rows
     .map((row) => row.fairValueDeribitIv)
+    .filter((value): value is number => value !== null);
+  const fairValueBlendedSigmaValues = rows
+    .map((row) => row.fairValueBlendedSigma)
     .filter((value): value is number => value !== null);
   const residuals = rows
     .map((row) => row.fMinusG)
@@ -145,9 +181,6 @@ function computeSummary(rows: ComputedReportRow[]) {
     avgF: average(fValues),
     minF: Math.min(...fValues),
     maxF: Math.max(...fValues),
-    avgSigma: average(sigmaValues),
-    minSigma: sigmaValues.length > 0 ? Math.min(...sigmaValues) : null,
-    maxSigma: sigmaValues.length > 0 ? Math.max(...sigmaValues) : null,
     avgAnnualizedSigma: average(annualizedSigmaValues),
     minAnnualizedSigma:
       annualizedSigmaValues.length > 0 ? Math.min(...annualizedSigmaValues) : null,
@@ -158,6 +191,11 @@ function computeSummary(rows: ComputedReportRow[]) {
       fairValueDeribitValues.length > 0 ? Math.min(...fairValueDeribitValues) : null,
     maxFairValueDeribitIv:
       fairValueDeribitValues.length > 0 ? Math.max(...fairValueDeribitValues) : null,
+    avgFairValueBlendedSigma: average(fairValueBlendedSigmaValues),
+    minFairValueBlendedSigma:
+      fairValueBlendedSigmaValues.length > 0 ? Math.min(...fairValueBlendedSigmaValues) : null,
+    maxFairValueBlendedSigma:
+      fairValueBlendedSigmaValues.length > 0 ? Math.max(...fairValueBlendedSigmaValues) : null,
     avgResidual: average(residuals),
     minResidual: residuals.length > 0 ? Math.min(...residuals) : null,
     maxResidual: residuals.length > 0 ? Math.max(...residuals) : null,
@@ -170,8 +208,8 @@ function toCsv(rows: ComputedReportRow[]): string {
     'ts',
     'published_at',
     'fair_value',
+    'fair_value_blended_sigma',
     'confidence',
-    'sigma',
     'annualized_sigma',
     'fair_value_deribit_iv',
     'chainlink_price',
@@ -195,8 +233,8 @@ function toCsv(rows: ComputedReportRow[]): string {
       String(row.ts),
       String(row.publishedAt),
       formatNum(row.fairValue),
+      formatMaybeNumber(row.fairValueBlendedSigma),
       formatNum(row.confidence),
-      formatMaybeNumber(row.sigma),
       formatMaybeNumber(row.annualizedSigma),
       formatMaybeNumber(row.fairValueDeribitIv),
       formatNum(row.chainlinkPrice, 2),
@@ -252,12 +290,14 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('');
   lines.push('- `chainlink price(t)` is the Chainlink BTC/USD spot used by the fair value model.');
   lines.push('- `yes token price(t)` uses `yes ask`.');
-  lines.push('- `sigma(t)` is the per-second EWMA volatility used by the fair value model.');
   lines.push(
-    '- `annualized_sigma(t) = sigma(t) * sqrt(60*60*24*365)` — same EWMA σ expressed as annualized fraction (e.g. 0.40 = 40%).',
+    '- `annualized_sigma(t) = sigma(t) * sqrt(60*60*24*365)` — EWMA σ from stored samples, annualized fraction (e.g. 0.40 = 40%).',
   );
   lines.push(
-    '- `fair_value_deribit_iv` is the binary-call fair value using Deribit `mark_iv` annualized volatility from market discovery.',
+    '- `fair_value_blended_sigma` is the binary-call fair value using blended volatility: annual σ = average(`annualized_sigma(t)`, Deribit `mark_iv` annual), converted to per-second for Black–Scholes; if only one source exists, that source is used.',
+  );
+  lines.push(
+    '- `fair_value_deribit_iv` is the binary-call fair value using only Deribit `mark_iv` annualized volatility from market discovery.',
   );
   lines.push('- `f(t) = fair value(t) - yes token price(t)`.');
   lines.push('- `g(t)` is the 5-point moving average of `f(t)` and is blank until 5 samples exist.');
@@ -269,15 +309,21 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push(`- avg f(t): ${formatMaybeNumber(summary.avgF) || 'N/A'}`);
   lines.push(`- min f(t): ${formatMaybeNumber(summary.minF) || 'N/A'}`);
   lines.push(`- max f(t): ${formatMaybeNumber(summary.maxF) || 'N/A'}`);
-  lines.push(`- avg sigma(t): ${formatMaybeNumber(summary.avgSigma) || 'N/A'}`);
-  lines.push(`- min sigma(t): ${formatMaybeNumber(summary.minSigma) || 'N/A'}`);
-  lines.push(`- max sigma(t): ${formatMaybeNumber(summary.maxSigma) || 'N/A'}`);
   lines.push(`- avg annualized_sigma(t): ${formatMaybeNumber(summary.avgAnnualizedSigma) || 'N/A'}`);
   lines.push(`- min annualized_sigma(t): ${formatMaybeNumber(summary.minAnnualizedSigma) || 'N/A'}`);
   lines.push(`- max annualized_sigma(t): ${formatMaybeNumber(summary.maxAnnualizedSigma) || 'N/A'}`);
   lines.push(`- avg fair_value_deribit_iv: ${formatMaybeNumber(summary.avgFairValueDeribitIv) || 'N/A'}`);
   lines.push(`- min fair_value_deribit_iv: ${formatMaybeNumber(summary.minFairValueDeribitIv) || 'N/A'}`);
   lines.push(`- max fair_value_deribit_iv: ${formatMaybeNumber(summary.maxFairValueDeribitIv) || 'N/A'}`);
+  lines.push(
+    `- avg fair_value_blended_sigma: ${formatMaybeNumber(summary.avgFairValueBlendedSigma) || 'N/A'}`,
+  );
+  lines.push(
+    `- min fair_value_blended_sigma: ${formatMaybeNumber(summary.minFairValueBlendedSigma) || 'N/A'}`,
+  );
+  lines.push(
+    `- max fair_value_blended_sigma: ${formatMaybeNumber(summary.maxFairValueBlendedSigma) || 'N/A'}`,
+  );
   lines.push(`- avg f(t)-g(t): ${formatMaybeNumber(summary.avgResidual) || 'N/A'}`);
   lines.push(`- min f(t)-g(t): ${formatMaybeNumber(summary.minResidual) || 'N/A'}`);
   lines.push(`- max f(t)-g(t): ${formatMaybeNumber(summary.maxResidual) || 'N/A'}`);
@@ -285,13 +331,13 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('## Rows');
   lines.push('');
   lines.push(
-    '| time | fair value | sigma | annualized σ | fv deribit iv | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f-g |',
+    '| time | fair value | fair value (σ EWMA+Deribit) | annualized σ | fv deribit iv | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f(t) | g(t) | f-g |',
   );
   lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
 
   for (const row of rows) {
     lines.push(
-      `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.sigma)} | ` +
+      `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.fairValueBlendedSigma)} | ` +
         `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
         `${formatNum(row.chainlinkPrice, 2)} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
         `${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
