@@ -22,7 +22,10 @@ export interface GeneratedMarketReport {
 
 interface ComputedReportRow extends MarketReportPoint {
   isoTime: string;
+  /** Chainlink spot (same as stored `btcPrice` on the report point). */
   chainlinkPrice: number;
+  /** Binance mid for CSV / tables (`btc_price` column). */
+  binancePrice: number | null;
   yesTokenPrice: number;
   /** sigma * sqrt(60*60*24*365) — annualized EWMA volatility (fractional, e.g. 0.65 ≈ 65%). */
   annualizedSigma: number | null;
@@ -83,21 +86,25 @@ function fileExists(path: string): Promise<boolean> {
   );
 }
 
-/**
- * Same 5-point MA as primary f/g, but clears the window when the current f is null (no Deribit / blended FV).
- */
-function rollingGForAlternateF(
-  window: number[],
-  fAlt: number | null,
+/** g(t) = mean(f(t−1)…f(t−10)); clears history when the current f is null (no Deribit / blended FV). */
+const G_PRIOR_SAMPLES = 10;
+
+function rollingGFromPriorF(
+  pastF: number[],
+  f: number | null,
 ): { g: number | null; fMinusG: number | null } {
-  if (fAlt === null) {
-    window.length = 0;
+  if (f === null) {
+    pastF.length = 0;
     return { g: null, fMinusG: null };
   }
-  window.push(fAlt);
-  if (window.length > 5) window.shift();
-  const g = window.length === 5 ? window.reduce((sum, v) => sum + v, 0) / 5 : null;
-  return { g, fMinusG: g === null ? null : fAlt - g };
+  const g =
+    pastF.length >= G_PRIOR_SAMPLES
+      ? pastF.reduce((sum, v) => sum + v, 0) / G_PRIOR_SAMPLES
+      : null;
+  const fMinusG = g === null ? null : f - g;
+  pastF.push(f);
+  if (pastF.length > G_PRIOR_SAMPLES) pastF.shift();
+  return { g, fMinusG };
 }
 
 function computeRows(
@@ -105,20 +112,16 @@ function computeRows(
   deribitAnnualVolatility: number | null,
 ): ComputedReportRow[] {
   const computed: ComputedReportRow[] = [];
-  const fWindow: number[] = [];
-  const fDeribitWindow: number[] = [];
-  const fMeanFvWindow: number[] = [];
+  const pastPrimaryF: number[] = [];
+  const pastDeribitF: number[] = [];
+  const pastMeanFvF: number[] = [];
   const perSecondDeribitVolatility =
     deribitAnnualVolatility !== null ? perSecondVolatilityFromAnnual(deribitAnnualVolatility) : null;
 
   for (const row of rows) {
     const yesTokenPrice = row.yesAsk;
     const f = row.fairValue - yesTokenPrice;
-    fWindow.push(f);
-    if (fWindow.length > 5) fWindow.shift();
-
-    const g = fWindow.length === 5 ? fWindow.reduce((sum, value) => sum + value, 0) / 5 : null;
-    const fMinusG = g === null ? null : f - g;
+    const { g, fMinusG } = rollingGFromPriorF(pastPrimaryF, f);
 
     const annualizedSigma =
       row.sigma !== null && row.sigma > 0 ? annualizedVolatilityFromPerSecond(row.sigma) : null;
@@ -151,20 +154,21 @@ function computeRows(
 
     const fDeribitIv =
       fairValueDeribitIv !== null ? fairValueDeribitIv - yesTokenPrice : null;
-    const { g: gDeribitIv, fMinusG: fMinusGDeribitIv } = rollingGForAlternateF(
-      fDeribitWindow,
-      fDeribitIv,
-    );
+    const { g: gDeribitIv, fMinusG: fMinusGDeribitIv } = rollingGFromPriorF(pastDeribitF, fDeribitIv);
 
     const fMeanFv =
       fairValueBlendedSigma !== null ? fairValueBlendedSigma - yesTokenPrice : null;
-    const { g: gMeanFv, fMinusG: fMinusGMeanFv } = rollingGForAlternateF(fMeanFvWindow, fMeanFv);
+    const { g: gMeanFv, fMinusG: fMinusGMeanFv } = rollingGFromPriorF(pastMeanFvF, fMeanFv);
+
+    const binancePrice =
+      row.binanceBtcPrice !== undefined && row.binanceBtcPrice !== null ? row.binanceBtcPrice : null;
 
     computed.push({
       ...row,
       sigma: row.sigma ?? null,
       isoTime: new Date(row.ts).toISOString(),
       chainlinkPrice: row.btcPrice,
+      binancePrice,
       yesTokenPrice,
       annualizedSigma,
       fairValueDeribitIv,
@@ -327,7 +331,7 @@ function toCsv(rows: ComputedReportRow[]): string {
       formatMaybeNumber(row.annualizedSigma),
       formatMaybeNumber(row.fairValueDeribitIv),
       formatNum(row.chainlinkPrice, 2),
-      formatNum(row.btcPrice, 2),
+      row.binancePrice !== null ? formatNum(row.binancePrice, 2) : '',
       formatMaybeNumber(row.strikePrice, 2),
       formatNum(row.yesBid),
       formatNum(row.yesAsk),
@@ -383,7 +387,12 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('');
   lines.push('## Formula Notes');
   lines.push('');
-  lines.push('- `chainlink price(t)` is the Chainlink BTC/USD spot used by the fair value model.');
+  lines.push(
+    '- `chainlink_price(t)` is the Chainlink BTC/USD spot used as **S** in the EWMA-σ fair value model.',
+  );
+  lines.push(
+    '- `btc_price(t)` is the Binance book-ticker **mid** at the same sample time (diagnostics / settlement proxy in downstream tools).',
+  );
   lines.push('- `yes token price(t)` uses `yes ask`.');
   lines.push(
     '- `annualized_sigma(t) = sigma(t) * sqrt(60*60*24*365)` — EWMA σ from stored samples, annualized fraction (e.g. 0.40 = 40%).',
@@ -395,12 +404,14 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
     '- `fair_value_deribit_iv` is the binary-call fair value using only Deribit `mark_iv` annualized volatility from market discovery.',
   );
   lines.push('- `f(t) = fair value(t) - yes token price(t)` — self EWMA σ fair value (a).');
-  lines.push('- `g(t)` is the 5-point moving average of `f(t)` and is blank until 5 samples exist.');
   lines.push(
-    '- **(b)** `f_deribit_iv` / `g_deribit_iv` / `f_minus_g_deribit_iv` (CSV): same construction as `f`/`g`/`f_minus_g` but `fair_value - yes_ask` uses `fair_value_deribit_iv`. The 5-point `g` window clears after any row where Deribit FV is missing.',
+    '- `g(t) = (1/10) * sum(f(t-k), k=1..10)` — average of the **previous** 10 `f` samples; blank until 10 prior rows exist.',
   );
   lines.push(
-    '- **(c)** `f_mean_fv` / `g_mean_fv` / `f_minus_g_mean_fv` (CSV): same using `fair_value_blended_sigma` (mean annual σ of EWMA and Deribit, then BS FV). Window clears when blended FV is missing.',
+    '- **(b)** `f_deribit_iv` / `g_deribit_iv` / `f_minus_g_deribit_iv` (CSV): same lag-10 `g` rule but `f` uses `fair_value_deribit_iv − yes_ask`. History clears after any row where Deribit FV is missing.',
+  );
+  lines.push(
+    '- **(c)** `f_mean_fv` / `g_mean_fv` / `f_minus_g_mean_fv` (CSV): same lag-10 `g` using `fair_value_blended_sigma − yes_ask`. History clears when blended FV is missing.',
   );
   lines.push('');
   lines.push('## Summary');
@@ -450,17 +461,17 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('## Rows');
   lines.push('');
   lines.push(
-    '| time | fair value | fair value (σ EWMA+Deribit) | annualized σ | fv deribit iv | chainlink | yes bid | yes ask | no bid | no ask | tte ms | f (a) | g (a) | f-g (a) | f (b) | g (b) | f-g (b) | f (c) | g (c) | f-g (c) |',
+    '| time | fair value | fair value (σ EWMA+Deribit) | annualized σ | fv deribit iv | chainlink | binance | yes bid | yes ask | no bid | no ask | tte ms | f (a) | g (a) | f-g (a) | f (b) | g (b) | f-g (b) | f (c) | g (c) | f-g (c) |',
   );
   lines.push(
-    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   );
 
   for (const row of rows) {
     lines.push(
       `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.fairValueBlendedSigma)} | ` +
         `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
-        `${formatNum(row.chainlinkPrice, 2)} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
+        `${formatNum(row.chainlinkPrice, 2)} | ${formatMaybeNumber(row.binancePrice, 2) || 'N/A'} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
         `${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
         `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} | ` +
         `${formatMaybeNumber(row.fDeribitIv)} | ${formatMaybeNumber(row.gDeribitIv)} | ` +

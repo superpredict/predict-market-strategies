@@ -1,11 +1,13 @@
 /**
- * Backtest simple (a)-variant f / g / f−g rules on existing market round report CSVs.
- * Long YES supports multiple adds with dynamic size, confidence / TTE / spread / vol / cap filters.
+ * Backtest variant **(b)** rules on existing market round report CSVs using
+ * `f_deribit_iv` / `g_deribit_iv` / `f_minus_g_deribit_iv`.
+ * Long and short YES: **1 share** per signal, cumulative position capped at **±20** (default).
+ * Long and short use the **same** filters (confidence, TTE, YES spread, sigma regime).
  * Writes a markdown summary under takerbot/reports/.
  *
  * Usage (from repo root):
  *   npm run takerbot:reportBacktest
- *   node --import tsx/esm takerbot/tools/backtestReportSignals.ts --delta 0.02 --gamma 0.01 --max-yes-shares 10
+ *   node --import tsx/esm takerbot/tools/backtestReportSignals.ts --delta 0.05 --gamma 0.03 --max-yes-shares 20
  * Optional: --min-confidence, --min-tte-ms, --max-yes-spread, --sigma-window, --sigma-min-ratio, --sigma-max-ratio
  */
 
@@ -14,26 +16,20 @@ import { resolve } from 'node:path';
 
 const REPORTS_DIR = resolve(process.cwd(), 'takerbot', 'reports');
 
-const DEFAULT_DELTA = 0.02;
-const DEFAULT_GAMMA = 0.01;
+const DEFAULT_DELTA = 0.05;
+const DEFAULT_GAMMA = 0.03;
 const DEFAULT_MIN_CONFIDENCE = 0.18;
 /** Require more than this many ms remaining (default 3 minutes). */
 const DEFAULT_MIN_TIME_TO_EXPIRY_MS = 3 * 60 * 1000;
 /** Max YES ask − bid (probability units) to treat book as tight enough. */
 const DEFAULT_MAX_YES_SPREAD = 0.08;
-/** Max cumulative long YES shares per market (scaled adds). */
-const DEFAULT_MAX_YES_SHARES = 10;
+/** Max cumulative long YES shares per market (and max short shares); fixed band is ±20 by default. */
+const DEFAULT_MAX_YES_SHARES = 20;
 /** Rolling window length for annualized_sigma median (volatility regime). */
 const DEFAULT_SIGMA_MEDIAN_WINDOW = 31;
 /** Current sigma must stay within [median×min, median×max]. */
 const DEFAULT_SIGMA_MIN_RATIO = 0.35;
 const DEFAULT_SIGMA_MAX_RATIO = 3.5;
-
-function clamp01(x: number): number {
-  if (x <= 0) return 0;
-  if (x >= 1) return 1;
-  return x;
-}
 
 function median(xs: number[]): number {
   if (xs.length === 0) return NaN;
@@ -101,8 +97,8 @@ function parseArgs(argv: string[]): CliArgs {
   if (!Number.isFinite(maxYesSpread) || maxYesSpread <= 0) {
     throw new Error(`invalid --max-yes-spread: ${maxYesSpread}`);
   }
-  if (!Number.isInteger(maxYesShares) || maxYesShares < 1) {
-    throw new Error(`invalid --max-yes-shares: ${maxYesShares}`);
+  if (!Number.isInteger(maxYesShares) || maxYesShares < 1 || maxYesShares > 20) {
+    throw new Error(`invalid --max-yes-shares: ${maxYesShares} (allowed 1–20)`);
   }
   if (!Number.isInteger(sigmaMedianWindow) || sigmaMedianWindow < 5) {
     throw new Error(`invalid --sigma-window: ${sigmaMedianWindow}`);
@@ -132,6 +128,7 @@ interface CsvRow {
   ts: number;
   fairValue: number;
   chainlinkPrice: number;
+  btcPrice: number | null;
   strikePrice: number | null;
   yesBid: number;
   yesAsk: number;
@@ -168,12 +165,13 @@ function parseCsv(content: string): CsvRow[] {
     ts: idx('ts'),
     fv: idx('fair_value'),
     cl: idx('chainlink_price'),
+    btc: idxOpt('btc_price'),
     strike: idx('strike_price'),
     bid: idx('yes_bid'),
     ask: idx('yes_ask'),
-    f: idx('f'),
-    g: idx('g'),
-    fg: idx('f_minus_g'),
+    f: idx('f_deribit_iv'),
+    g: idx('g_deribit_iv'),
+    fg: idx('f_minus_g_deribit_iv'),
     conf: idxOpt('confidence'),
     tte: idxOpt('time_to_expiry_ms'),
     sig: idxOpt('annualized_sigma'),
@@ -189,11 +187,13 @@ function parseCsv(content: string): CsvRow[] {
     const conf = I.conf !== null ? parseNum(cols[I.conf]!) : null;
     const tte = I.tte !== null ? parseNum(cols[I.tte]!) : null;
     const sig = I.sig !== null ? parseNum(cols[I.sig]!) : null;
+    const btcParsed = I.btc !== null ? parseNum(cols[I.btc]!) : null;
     rows.push({
       isoTime: cols[I.iso]!,
       ts: Number(cols[I.ts]),
       fairValue: Number(cols[I.fv]),
       chainlinkPrice: Number(cols[I.cl]),
+      btcPrice: btcParsed,
       strikePrice: strike,
       yesBid: Number(cols[I.bid]),
       yesAsk: Number(cols[I.ask]),
@@ -228,7 +228,7 @@ interface BuyScaledResult {
   slug: string;
   sourceCsv: string;
   strike: number;
-  settlementChainlink: number;
+  settlementPrice: number;
   yesPayoff: 0 | 1;
   fills: BuyFill[];
   totalShares: number;
@@ -236,29 +236,34 @@ interface BuyScaledResult {
   pnl: number;
 }
 
-interface TradeResult {
-  slug: string;
-  sourceCsv: string;
-  strike: number;
-  settlementChainlink: number;
-  yesPayoff: 0 | 1;
-  /** First row index (0-based in sorted rows) where signal fired */
+interface ShortFill {
   entryRowIndex: number;
   entryIso: string;
-  entryYesAsk?: number;
-  entryYesBid?: number;
+  entryYesBid: number;
   f: number;
   g: number;
   fMinusG: number;
+  confidence: number;
+}
+
+interface ShortScaledResult {
+  slug: string;
+  sourceCsv: string;
+  strike: number;
+  settlementPrice: number;
+  yesPayoff: 0 | 1;
+  fills: ShortFill[];
+  totalShares: number;
+  totalCredit: number;
   pnl: number;
 }
 
 interface BacktestFileOutcome {
   strike: number | null;
-  settlementChainlink: number | null;
+  settlementPrice: number | null;
   yesPayoff: 0 | 1 | null;
   buyScaled: BuyScaledResult | null;
-  sell: TradeResult | null;
+  shortScaled: ShortScaledResult | null;
   skipReason: string | null;
 }
 
@@ -285,26 +290,6 @@ function sigmaRegimeOk(
   return cur >= med * minRatio && cur <= med * maxRatio;
 }
 
-/** Shares to add this signal; larger when confidence / edge headroom is higher. */
-function dynamicBuyQty(
-  confidence: number,
-  minConfidence: number,
-  f: number,
-  delta: number,
-  fMinusG: number,
-  gamma: number,
-  room: number,
-): number {
-  if (room <= 0) return 0;
-  const confHead = clamp01((confidence - minConfidence) / Math.max(1e-9, 1 - minConfidence));
-  const fHead = clamp01((f - delta) / 0.08);
-  const fgHead = clamp01((fMinusG - gamma) / 0.05);
-  const score = clamp01(confHead * 0.65 + fHead * 0.175 + fgHead * 0.175);
-  const capThisFill = Math.min(room, 5);
-  const qty = Math.max(1, Math.min(room, Math.round(1 + score * (capThisFill - 1))));
-  return qty;
-}
-
 function runBacktestOnRows(
   slug: string,
   sourceCsv: string,
@@ -325,10 +310,10 @@ function runBacktestOnRows(
   if (rows.length === 0) {
     return {
       strike: null,
-      settlementChainlink: null,
+      settlementPrice: null,
       yesPayoff: null,
       buyScaled: null,
-      sell: null,
+      shortScaled: null,
       skipReason: 'empty CSV',
     };
   }
@@ -337,22 +322,26 @@ function runBacktestOnRows(
   if (strike === null || strike <= 0) {
     return {
       strike: null,
-      settlementChainlink: null,
+      settlementPrice: null,
       yesPayoff: null,
       buyScaled: null,
-      sell: null,
+      shortScaled: null,
       skipReason: 'no positive strike_price',
     };
   }
 
-  const last = rows[rows.length - 1];
-  const settlementPx = last!.chainlinkPrice;
+  const last = rows[rows.length - 1]!;
+  const settlementPx =
+    last.btcPrice !== null && last.btcPrice > 0 && Number.isFinite(last.btcPrice)
+      ? last.btcPrice
+      : last.chainlinkPrice;
   const yesPayoff = yesPayoffAtExpiry(settlementPx, strike);
 
   const buyFills: BuyFill[] = [];
   let positionYes = 0;
 
-  let sell: TradeResult | null = null;
+  const shortFills: ShortFill[] = [];
+  let positionShort = 0;
 
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -390,36 +379,19 @@ function runBacktestOnRows(
 
     const room = args.maxYesShares - positionYes;
 
-    if (
-      buySignal &&
-      spreadOk &&
-      confOk &&
-      tteOk &&
-      volOk &&
-      room > 0
-    ) {
-      const qty = dynamicBuyQty(
-        r.confidence!,
-        args.minConfidence,
-        r.f,
-        args.delta,
-        r.fMinusG!,
-        args.gamma,
-        room,
-      );
-      if (qty > 0) {
-        buyFills.push({
-          entryRowIndex: i,
-          entryIso: r.isoTime,
-          qty,
-          entryYesAsk: r.yesAsk,
-          f: r.f,
-          g: r.g,
-          fMinusG: r.fMinusG,
-          confidence: r.confidence!,
-        });
-        positionYes += qty;
-      }
+    if (buySignal && spreadOk && confOk && tteOk && volOk && room > 0) {
+      const qty = 1;
+      buyFills.push({
+        entryRowIndex: i,
+        entryIso: r.isoTime,
+        qty,
+        entryYesAsk: r.yesAsk,
+        f: r.f,
+        g: r.g,
+        fMinusG: r.fMinusG,
+        confidence: r.confidence!,
+      });
+      positionYes += qty;
     }
 
     const sellOk =
@@ -428,22 +400,18 @@ function runBacktestOnRows(
       r.yesBid > 0 &&
       Number.isFinite(r.yesBid);
 
-    if (sellOk && sell === null) {
-      const pnl = r.yesBid - yesPayoff;
-      sell = {
-        slug,
-        sourceCsv,
-        strike,
-        settlementChainlink: settlementPx,
-        yesPayoff,
+    const roomShort = args.maxYesShares - positionShort;
+    if (sellOk && spreadOk && confOk && tteOk && volOk && roomShort > 0) {
+      shortFills.push({
         entryRowIndex: i,
         entryIso: r.isoTime,
         entryYesBid: r.yesBid,
         f: r.f,
         g: r.g,
         fMinusG: r.fMinusG,
-        pnl,
-      };
+        confidence: r.confidence!,
+      });
+      positionShort += 1;
     }
   }
 
@@ -456,7 +424,7 @@ function runBacktestOnRows(
       slug,
       sourceCsv,
       strike,
-      settlementChainlink: settlementPx,
+      settlementPrice: settlementPx,
       yesPayoff,
       fills: buyFills,
       totalShares,
@@ -465,12 +433,30 @@ function runBacktestOnRows(
     };
   }
 
+  let shortScaled: ShortScaledResult | null = null;
+  if (shortFills.length > 0) {
+    const totalShares = shortFills.length;
+    const totalCredit = shortFills.reduce((s, f) => s + f.entryYesBid, 0);
+    const pnl = totalCredit - yesPayoff * totalShares;
+    shortScaled = {
+      slug,
+      sourceCsv,
+      strike,
+      settlementPrice: settlementPx,
+      yesPayoff,
+      fills: shortFills,
+      totalShares,
+      totalCredit,
+      pnl,
+    };
+  }
+
   return {
     strike,
-    settlementChainlink: settlementPx,
+    settlementPrice: settlementPx,
     yesPayoff,
     buyScaled,
-    sell,
+    shortScaled,
     skipReason: null,
   };
 }
@@ -483,16 +469,16 @@ interface MarketRow {
   slug: string;
   source: string;
   strike: number | null;
-  settlementChainlink: number | null;
+  settlementPrice: number | null;
   yesPayoff: 0 | 1 | null;
   buyScaled: BuyScaledResult | null;
-  sell: TradeResult | null;
+  shortScaled: ShortScaledResult | null;
   skipReason: string | null;
 }
 
 function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string): string {
   const lines: string[] = [];
-  lines.push(`# Report backtest (variant **(a)**): f / g / f−g`);
+  lines.push(`# Report backtest (variant **(b)**): f_deribit_iv / g_deribit_iv / f_minus_g_deribit_iv`);
   lines.push('');
   lines.push(`- generated: ${new Date().toISOString()}`);
   lines.push(`- output: \`takerbot/reports/${outputName}\``);
@@ -501,24 +487,44 @@ function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string):
 
   lines.push('## Assumptions (read carefully)');
   lines.push('');
-  lines.push('1. **Variant (a) only** — Signals use CSV columns `f`, `g`, and `f_minus_g` where `f = fair_value − yes_ask` (EWMA σ fair value), matching the round report definition.');
-  lines.push('2. **Rolling `g`** — A row is eligible only when `g` and `f_minus_g` are present (the 5-sample moving average is defined; same as the report).');
-  lines.push('3. **Long YES: multiple adds** — Each row is evaluated in ascending `ts`. Whenever the buy rule holds **and** the extra risk filters pass, a **dynamic** number of shares (1 up to min(5, room)) is added; cumulative size is capped at `--max-yes-shares`.');
-  lines.push('4. **Short YES** — Still **one** 1-share short leg per file: first row satisfying the sell rule (unchanged baseline).');
-  lines.push('5. **Hold to settlement** — No interim exit; long PnL is `yesPayoff × totalShares − sum(qty × yes_ask)` over all adds.');
-  lines.push('6. **YES payoff** — `yesPayoff = 1` if settlement Chainlink **strictly exceeds** strike `K`, else `0`.');
-  lines.push('7. **Settlement price proxy** — `chainlink_price` on the **last** CSV row.');
+  lines.push(
+    '1. **Variant (b)** — Signals use CSV columns `f_deribit_iv`, `g_deribit_iv`, and `f_minus_g_deribit_iv` (Deribit mark-IV fair value minus YES ask), matching the round report definition.',
+  );
+  lines.push(
+    '2. **`g` in CSV** — Produced by the round report as the mean of the **previous** 10 `f` samples (`g(t) = average(f(t−1)…f(t−10))`); a row is eligible only when `g` and `f_minus_g` are non-blank.',
+  );
+  lines.push(
+    '3. **Long YES** — Each qualifying row adds **exactly 1** share; cumulative long size is capped at `--max-yes-shares` (max **20**).',
+  );
+  lines.push(
+    '4. **Short YES** — Each qualifying row adds **exactly 1** short share; cumulative short size uses the **same** cap (independent long/short books, not netted).',
+  );
+  lines.push('5. **Hold to settlement** — No interim exit; long PnL is `yesPayoff × totalShares − sum(yes_ask)`; short PnL is `sum(yes_bid) − yesPayoff × totalShares`.');
+  lines.push(
+    '6. **YES payoff** — `yesPayoff = 1` if settlement spot **strictly exceeds** strike `K`, else `0` (same strike rule as before).',
+  );
+  lines.push(
+    '7. **Settlement price proxy** — `btc_price` on the **last** CSV row when present (Binance mid in new reports); otherwise `chainlink_price`.',
+  );
   lines.push('8. **Strike** — From `strike_price` (first positive); else file skipped.');
-  lines.push('9. **Long filters** — In addition to `f` / `f−g`: `confidence ≥ minConfidence`; `time_to_expiry_ms > minTte`; YES spread `yes_ask − yes_bid ≤ maxYesSpread`; `annualized_sigma` within `[median×minRatio, median×maxRatio]` over a trailing window (needs enough sigma samples).');
+  lines.push(
+    '9. **Shared filters (long and short)** — In addition to the respective `f` / `f−g` sign rules: `confidence ≥ minConfidence`; `time_to_expiry_ms > minTte`; YES spread `yes_ask − yes_bid ≤ maxYesSpread`; `annualized_sigma` within `[median×minRatio, median×maxRatio]` over a trailing window.',
+  );
   lines.push('10. **Fees, funding, borrow, latency** — Ignored. Slippage beyond bid/ask columns ignored.');
   lines.push('11. **Overlapping long and short** — Backtested **independently** (not netted).');
-  lines.push('12. **Optional CSV columns** — If `confidence`, `time_to_expiry_ms`, or `annualized_sigma` are missing from the header, long adds are effectively disabled (filters never pass).');
+  lines.push(
+    '12. **Optional CSV columns** — If `confidence`, `time_to_expiry_ms`, or `annualized_sigma` are missing from the header, **both** long and short adds are effectively disabled (filters never pass).',
+  );
   lines.push('');
 
   lines.push('## Rule definitions');
   lines.push('');
-  lines.push('- **Buy YES (each add)** when: `g` defined, `f ≥ δ`, `f − g ≥ γ`, plus the long filters in assumption 9.');
-  lines.push('- **Sell YES (short)** when: `g` defined, `f ≤ −δ`, `f − g ≤ −γ` (first hit only, 1 share).');
+  lines.push(
+    '- **Buy YES (+1 sh)** when: `g` defined, `f ≥ δ`, `f − g ≥ γ`, plus the shared filters in assumption 9.',
+  );
+  lines.push(
+    '- **Sell YES (+1 short sh)** when: `g` defined, `f ≤ −δ`, `f − g ≤ −γ`, plus the **same** shared filters in assumption 9, and room under the position cap.',
+  );
   lines.push('');
 
   lines.push('## Parameters used in this run');
@@ -528,7 +534,7 @@ function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string):
   lines.push(`- min confidence: **${args.minConfidence}**`);
   lines.push(`- min time-to-expiry (ms): **${args.minTimeToExpiryMs}** (must be **strictly greater** than this)`);
   lines.push(`- max YES spread (ask−bid): **${args.maxYesSpread}**`);
-  lines.push(`- max cumulative YES shares (long): **${args.maxYesShares}**`);
+  lines.push(`- max cumulative shares per side (long cap / short cap): **${args.maxYesShares}** (fixed band ±20 when using defaults)`);
   lines.push(`- sigma median window: **${args.sigmaMedianWindow}**, ratio band: **[${args.sigmaMinRatio}, ${args.sigmaMaxRatio}]× median**`);
   lines.push(`- reports directory: \`${args.reportsDir}\``);
   lines.push('');
@@ -536,25 +542,25 @@ function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string):
   lines.push('## Per-market results');
   lines.push('');
   lines.push(
-    '| source CSV | strike | settlement CL | YES payoff | long shares | long cost | long PnL | # long adds | sell @ bid | sell PnL | first long | first short |',
+    '| source CSV | strike | settlement | YES payoff | long sh | long cost | long PnL | #L | short sh | short PnL | #S | first long | first short |',
   );
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |');
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |');
 
   let sumBuy = 0;
   let nBuyMkts = 0;
-  let sumSell = 0;
-  let nSell = 0;
+  let sumShort = 0;
+  let nShortMkts = 0;
 
   for (const m of results) {
     const bs = m.buyScaled;
-    const s = m.sell;
+    const ss = m.shortScaled;
     if (bs) {
       sumBuy += bs.pnl;
       nBuyMkts += 1;
     }
-    if (s) {
-      sumSell += s.pnl;
-      nSell += 1;
+    if (ss) {
+      sumShort += ss.pnl;
+      nShortMkts += 1;
     }
     if (m.skipReason !== null) {
       lines.push(
@@ -571,15 +577,16 @@ function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string):
           '—',
           '—',
           '—',
+          '—',
         ].join(' | '),
       );
       continue;
     }
     const strike = m.strike!;
-    const setPx = m.settlementChainlink!;
+    const setPx = m.settlementPrice!;
     const yp = m.yesPayoff!;
     const firstLong = bs && bs.fills[0] ? bs.fills[0].entryIso : '—';
-    const firstShort = s ? s.entryIso : '—';
+    const firstShort = ss && ss.fills[0] ? ss.fills[0].entryIso : '—';
     lines.push(
       [
         `\`${m.source}\``,
@@ -590,8 +597,9 @@ function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string):
         bs ? formatMoney(bs.totalCost) : '—',
         bs ? formatMoney(bs.pnl) : '—',
         bs ? String(bs.fills.length) : '0',
-        s ? s.entryYesBid!.toFixed(6) : '—',
-        s ? formatMoney(s.pnl) : '—',
+        ss ? String(ss.totalShares) : '0',
+        ss ? formatMoney(ss.pnl) : '—',
+        ss ? String(ss.fills.length) : '0',
         firstLong,
         firstShort,
       ].join(' | '),
@@ -602,12 +610,14 @@ function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string):
   lines.push('## Aggregate (over markets with a fill)');
   lines.push('');
   lines.push(
-    `- long (scaled): **${nBuyMkts}** markets with ≥1 add, sum PnL: **${formatMoney(sumBuy)}**, avg/market: **${nBuyMkts ? formatMoney(sumBuy / nBuyMkts) : 'n/a'}**`,
+    `- long: **${nBuyMkts}** markets with ≥1 add, sum PnL: **${formatMoney(sumBuy)}**, avg/market: **${nBuyMkts ? formatMoney(sumBuy / nBuyMkts) : 'n/a'}**`,
   );
-  lines.push(`- sell legs: **${nSell}**, sum PnL: **${formatMoney(sumSell)}**, avg: **${nSell ? formatMoney(sumSell / nSell) : 'n/a'}**`);
+  lines.push(
+    `- short: **${nShortMkts}** markets with ≥1 short add, sum PnL: **${formatMoney(sumShort)}**, avg/market: **${nShortMkts ? formatMoney(sumShort / nShortMkts) : 'n/a'}**`,
+  );
   lines.push('');
 
-  lines.push('## Detail: scaled long adds per file');
+  lines.push('## Detail: long adds per file (+1 sh each)');
   lines.push('');
   for (const m of results) {
     const bs = m.buyScaled;
@@ -631,22 +641,27 @@ function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string):
   }
   lines.push('');
 
-  lines.push('## Detail: first short per file (if any)');
+  lines.push('## Detail: short adds per file (+1 sh each)');
   lines.push('');
   for (const m of results) {
-    const s = m.sell;
+    const ss = m.shortScaled;
     if (m.skipReason !== null) {
       lines.push(`- \`${m.source}\` / ${m.slug}: **skipped** (${m.skipReason})`);
       continue;
     }
-    if (!s) {
-      lines.push(`- \`${m.source}\` / ${m.slug}: **no sell signal**`);
+    if (!ss || ss.fills.length === 0) {
+      lines.push(`- \`${m.source}\` / ${m.slug}: **no short fills**`);
       continue;
     }
     lines.push(
-      `- \`${m.source}\` / ${m.slug}: time \`${s.entryIso}\`, bid **${s.entryYesBid}**, ` +
-        `f=${s.f.toFixed(6)} g=${s.g.toFixed(6)} f−g=${s.fMinusG.toFixed(6)} → PnL **${formatMoney(s.pnl)}** (payoff ${s.yesPayoff})`,
+      `- \`${m.source}\` / ${m.slug}: **${ss.fills.length}** short add(s), credit **${formatMoney(ss.totalCredit)}** → PnL **${formatMoney(ss.pnl)}** (payoff ${ss.yesPayoff} per sh)`,
     );
+    for (const f of ss.fills) {
+      lines.push(
+        `  - \`${f.entryIso}\`  bid **${f.entryYesBid.toFixed(6)}**  conf=${f.confidence.toFixed(4)}  ` +
+          `f=${f.f.toFixed(6)} g=${f.g.toFixed(6)} f−g=${f.fMinusG.toFixed(6)}`,
+      );
+    }
   }
   lines.push('');
 
@@ -673,10 +688,10 @@ async function main(): Promise<void> {
       slug,
       source: name,
       strike: out.strike,
-      settlementChainlink: out.settlementChainlink,
+      settlementPrice: out.settlementPrice,
       yesPayoff: out.yesPayoff,
       buyScaled: out.buyScaled,
-      sell: out.sell,
+      shortScaled: out.shortScaled,
       skipReason: out.skipReason,
     });
   }

@@ -32,6 +32,7 @@ import { computeBaseFairValue, computeFairValueConfidence } from '../shared/fair
 import {
   appendMarketReportRow,
   getActiveMarket,
+  getBtcPrice,
   getChainlinkBtcPrice,
   getChainlinkBtcPriceHistory,
   getOrderbook,
@@ -170,12 +171,14 @@ async function computeAndPublish(
   };
 
   await setFairValue(fv);
+  const binanceFeed = await getBtcPrice();
   await appendMarketReportRow({
     marketId: MARKET_ID,
     fairValue: value,
     confidence,
     sigma: sigmaPerSecond,
     btcPrice: btcFeed.price,
+    binanceBtcPrice: binanceFeed !== null ? binanceFeed.price : null,
     strikePrice: STRIKE_PRICE,
     timeToExpiryMs,
     yesBid: obFeed.bestBid,

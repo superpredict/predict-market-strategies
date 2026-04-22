@@ -52,7 +52,10 @@ export interface MarketReportPoint {
   fairValue: number;
   confidence: number;
   sigma: number | null;
+  /** Chainlink BTC/USD spot used for the EWMA fair value model (S in Black–Scholes). */
   btcPrice: number;
+  /** Binance book-ticker mid at report time; CSV column `btc_price` in round reports. */
+  binanceBtcPrice?: number | null;
   strikePrice: number | null;
   timeToExpiryMs: number;
   yesBid: number;
