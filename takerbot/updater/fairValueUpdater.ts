@@ -53,14 +53,97 @@ dotenv.config();
 let MARKET_ID: string | null = null;
 let STRIKE_PRICE: number | null = null;
 let EXPIRY_TS: number | null = null;
+let lastReportYesBid: number | null = null;
+let lastReportYesAsk: number | null = null;
 const volatilityEstimator = new EWMAVolatility({
   lambda: VOLATILITY_EWMA_LAMBDA,
   minTicks: VOLATILITY_MIN_TICKS,
 });
+const volatilityEstimator1m = new EWMAVolatility({
+  lambda: VOLATILITY_EWMA_LAMBDA,
+  minTicks: VOLATILITY_MIN_TICKS,
+});
+const volatilityEstimator5m = new EWMAVolatility({
+  lambda: VOLATILITY_EWMA_LAMBDA,
+  minTicks: VOLATILITY_MIN_TICKS,
+});
 let sigmaNotReadyLogged = false;
+const ZERO_PRICE_ANOMALY_JUMP = 0.2;
+const ONE_MINUTE_MS = 60_000;
+const FIVE_MINUTES_MS = 5 * 60_000;
+
+class CoarseChainlinkSampler {
+  private readonly intervalMs: number;
+  private currentBucketStartMs: number | null = null;
+  private lastPriceInBucket: number | null = null;
+
+  constructor(intervalMs: number) {
+    this.intervalMs = intervalMs;
+  }
+
+  update(price: number, timestampMs: number): number | null {
+    const bucketStart = Math.floor(timestampMs / this.intervalMs) * this.intervalMs;
+    if (this.currentBucketStartMs === null) {
+      this.currentBucketStartMs = bucketStart;
+      this.lastPriceInBucket = price;
+      return null;
+    }
+
+    if (bucketStart === this.currentBucketStartMs) {
+      this.lastPriceInBucket = price;
+      return null;
+    }
+
+    const sampledPrice = this.lastPriceInBucket;
+    this.currentBucketStartMs = bucketStart;
+    this.lastPriceInBucket = price;
+    if (sampledPrice === null) return null;
+    return sampledPrice;
+  }
+}
+
+const chainlinkSampler1m = new CoarseChainlinkSampler(ONE_MINUTE_MS);
+const chainlinkSampler5m = new CoarseChainlinkSampler(FIVE_MINUTES_MS);
 
 function clampOutcomePrice(value: number): number {
   return Math.min(1, Math.max(0, value));
+}
+
+function sanitizeYesTopOfBook(yesBid: number, yesAsk: number): { yesBid: number; yesAsk: number } {
+  let bid = yesBid;
+  let ask = yesAsk;
+
+  const askCollapsedToZero =
+    ask === 0 &&
+    lastReportYesAsk !== null &&
+    lastReportYesAsk > 0 &&
+    Math.abs(lastReportYesAsk - ask) >= ZERO_PRICE_ANOMALY_JUMP &&
+    bid > 0;
+  if (askCollapsedToZero) {
+    const prevAsk = lastReportYesAsk!;
+    ask = bid;
+    console.warn(
+      `[fairValueUpdater] corrected anomalous yesAsk 0.0000 -> ${ask.toFixed(4)} ` +
+      `(prevAsk=${prevAsk.toFixed(4)}, bid=${bid.toFixed(4)})`
+    );
+  }
+
+  const bidCollapsedToZero =
+    bid === 0 &&
+    lastReportYesBid !== null &&
+    lastReportYesBid > 0 &&
+    Math.abs(lastReportYesBid - bid) >= ZERO_PRICE_ANOMALY_JUMP &&
+    ask > 0;
+  if (bidCollapsedToZero) {
+    const prevBid = lastReportYesBid!;
+    bid = ask;
+    console.warn(
+      `[fairValueUpdater] corrected anomalous yesBid 0.0000 -> ${bid.toFixed(4)} ` +
+      `(prevBid=${prevBid.toFixed(4)}, ask=${ask.toFixed(4)})`
+    );
+  }
+
+  return { yesBid: bid, yesAsk: ask };
 }
 
 function getCurrentSigmaPerSecond(): number | null {
@@ -68,6 +151,12 @@ function getCurrentSigmaPerSecond(): number | null {
   if (!volatilityEstimator.isReady() || sigma <= 0) {
     return null;
   }
+  return sigma;
+}
+
+function getCurrentSigmaFrom(estimator: EWMAVolatility): number | null {
+  const sigma = estimator.getVolatility();
+  if (!estimator.isReady() || sigma <= 0) return null;
   return sigma;
 }
 
@@ -79,9 +168,25 @@ async function warmVolatilityEstimator(): Promise<void> {
   }
 
   const sigma = volatilityEstimator.warmFromChainlinkHistory(history);
+  for (const tick of [...history].sort((a, b) => a.chainlinkTs - b.chainlinkTs)) {
+    const sampled1m = chainlinkSampler1m.update(tick.price, tick.chainlinkTs);
+    if (sampled1m !== null) {
+      const sampled1mTs = Math.floor(tick.chainlinkTs / ONE_MINUTE_MS) * ONE_MINUTE_MS;
+      volatilityEstimator1m.update(sampled1m, sampled1mTs);
+    }
+    const sampled5m = chainlinkSampler5m.update(tick.price, tick.chainlinkTs);
+    if (sampled5m !== null) {
+      const sampled5mTs = Math.floor(tick.chainlinkTs / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
+      volatilityEstimator5m.update(sampled5m, sampled5mTs);
+    }
+  }
+  const sigma1m = getCurrentSigmaFrom(volatilityEstimator1m);
+  const sigma5m = getCurrentSigmaFrom(volatilityEstimator5m);
   console.log(
     `[fairValueUpdater] warmed EWMA sigma=${sigma.toExponential(3)} ` +
-    `from ${history.length} Chainlink ticks`
+    `from ${history.length} Chainlink ticks ` +
+    `(sigma1m=${sigma1m !== null ? sigma1m.toExponential(3) : 'n/a'}, ` +
+    `sigma5m=${sigma5m !== null ? sigma5m.toExponential(3) : 'n/a'})`
   );
 }
 
@@ -135,6 +240,26 @@ async function computeAndPublish(
     timeToExpiryMs,
     perSecondVolatility: sigmaPerSecond,
   });
+  const sigma1m = getCurrentSigmaFrom(volatilityEstimator1m);
+  const sigma5m = getCurrentSigmaFrom(volatilityEstimator5m);
+  const fairValueSigma1m =
+    sigma1m !== null
+      ? computeBaseFairValue({
+          currentPrice: btcFeed.price,
+          strikePrice: STRIKE_PRICE,
+          timeToExpiryMs,
+          perSecondVolatility: sigma1m,
+        })
+      : null;
+  const fairValueSigma5m =
+    sigma5m !== null
+      ? computeBaseFairValue({
+          currentPrice: btcFeed.price,
+          strikePrice: STRIKE_PRICE,
+          timeToExpiryMs,
+          perSecondVolatility: sigma5m,
+        })
+      : null;
   const { confidence, timeBonus, atFloor } = computeFairValueConfidence(
     timeToExpiryMs,
     MIN_CONFIDENCE
@@ -170,6 +295,7 @@ async function computeAndPublish(
     ts: now,
   };
 
+  const { yesBid, yesAsk } = sanitizeYesTopOfBook(obFeed.bestBid, obFeed.bestAsk);
   await setFairValue(fv);
   const binanceFeed = await getBtcPrice();
   await appendMarketReportRow({
@@ -177,17 +303,25 @@ async function computeAndPublish(
     fairValue: value,
     confidence,
     sigma: sigmaPerSecond,
+    sigma1m,
+    sigma5m,
     btcPrice: btcFeed.price,
+    chainlinkTs: btcFeed.chainlinkTs,
     binanceBtcPrice: binanceFeed !== null ? binanceFeed.price : null,
+    binanceTs: binanceFeed !== null ? binanceFeed.ts : null,
     strikePrice: STRIKE_PRICE,
     timeToExpiryMs,
-    yesBid: obFeed.bestBid,
-    yesAsk: obFeed.bestAsk,
-    noBid: clampOutcomePrice(1 - obFeed.bestAsk),
-    noAsk: clampOutcomePrice(1 - obFeed.bestBid),
+    yesBid,
+    yesAsk,
+    noBid: clampOutcomePrice(1 - yesAsk),
+    noAsk: clampOutcomePrice(1 - yesBid),
     publishedAt: now,
     ts: now,
+    fairValueSigma1m,
+    fairValueSigma5m,
   });
+  lastReportYesBid = yesBid;
+  lastReportYesAsk = yesAsk;
 
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.fairValueUpdated(MARKET_ID), JSON.stringify(fv));
@@ -196,9 +330,11 @@ async function computeAndPublish(
     `[fairValueUpdater] STRIKE FV=${(value * 100).toFixed(2)}% ` +
     `conf=${(confidence * 100).toFixed(0)}% ` +
     `sigma=${sigmaPerSecond.toExponential(3)} ` +
+    `sigma1m=${sigma1m !== null ? sigma1m.toExponential(3) : 'n/a'} ` +
+    `sigma5m=${sigma5m !== null ? sigma5m.toExponential(3) : 'n/a'} ` +
     `chainlink=$${btcFeed.price.toFixed(2)} ` +
     `strike=$${STRIKE_PRICE.toFixed(2)} ` +
-    `yesAsk=${(obFeed.bestAsk || 0).toFixed(4)} ` +
+      `yesBid=${yesBid.toFixed(4)} yesAsk=${yesAsk.toFixed(4)} ` +
     `tte=${Math.round(timeToExpiryMs / 1000)}s`
   );
 }
@@ -229,6 +365,8 @@ async function rotateToMarket(
   MARKET_ID = newMarketId;
   EXPIRY_TS = info.expiryTs;
   STRIKE_PRICE = info.strikePrice; // set by marketDiscovery from Vatic active target
+  lastReportYesBid = null;
+  lastReportYesAsk = null;
 
   if (STRIKE_PRICE === null) {
     console.warn(
@@ -275,6 +413,16 @@ async function start(): Promise<void> {
           if (channel === chainlinkChannel) {
             const btcFeed = JSON.parse(message) as ChainlinkBtcPriceFeed;
             volatilityEstimator.update(btcFeed.price, btcFeed.chainlinkTs);
+            const sampled1m = chainlinkSampler1m.update(btcFeed.price, btcFeed.chainlinkTs);
+            if (sampled1m !== null) {
+              const sampled1mTs = Math.floor(btcFeed.chainlinkTs / ONE_MINUTE_MS) * ONE_MINUTE_MS;
+              volatilityEstimator1m.update(sampled1m, sampled1mTs);
+            }
+            const sampled5m = chainlinkSampler5m.update(btcFeed.price, btcFeed.chainlinkTs);
+            if (sampled5m !== null) {
+              const sampled5mTs = Math.floor(btcFeed.chainlinkTs / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
+              volatilityEstimator5m.update(sampled5m, sampled5mTs);
+            }
             const obFeed = await getOrderbook(MARKET_ID);
             if (!obFeed) return;
             await computeAndPublish(btcFeed, obFeed);

@@ -52,10 +52,22 @@ export interface MarketReportPoint {
   fairValue: number;
   confidence: number;
   sigma: number | null;
+  /** EWMA sigma computed from 1-minute Chainlink samples, in per-second units. */
+  sigma1m: number | null;
+  /** EWMA sigma computed from 5-minute Chainlink samples, in per-second units. */
+  sigma5m: number | null;
+  /** Fair value computed with sigma1m (same Black–Scholes contract). */
+  fairValueSigma1m: number | null;
+  /** Fair value computed with sigma5m (same Black–Scholes contract). */
+  fairValueSigma5m: number | null;
   /** Chainlink BTC/USD spot used for the EWMA fair value model (S in Black–Scholes). */
   btcPrice: number;
+  /** Chainlink payload timestamp (epoch ms) used by volatility estimator updates. */
+  chainlinkTs: number;
   /** Binance book-ticker mid at report time; CSV column `btc_price` in round reports. */
   binanceBtcPrice?: number | null;
+  /** Binance source tick timestamp (epoch ms) from btcPriceFeeder payload. */
+  binanceTs?: number | null;
   strikePrice: number | null;
   timeToExpiryMs: number;
   yesBid: number;

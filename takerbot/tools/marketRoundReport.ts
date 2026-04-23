@@ -29,6 +29,10 @@ interface ComputedReportRow extends MarketReportPoint {
   yesTokenPrice: number;
   /** sigma * sqrt(60*60*24*365) — annualized EWMA volatility (fractional, e.g. 0.65 ≈ 65%). */
   annualizedSigma: number | null;
+  /** Annualized volatility from 1-minute sampled EWMA sigma. */
+  annualizedSigma1m: number | null;
+  /** Annualized volatility from 5-minute sampled EWMA sigma. */
+  annualizedSigma5m: number | null;
   /** Same Black–Scholes binary call as fair_value, but σ = Deribit mark_iv annualized. */
   fairValueDeribitIv: number | null;
   /**
@@ -125,6 +129,10 @@ function computeRows(
 
     const annualizedSigma =
       row.sigma !== null && row.sigma > 0 ? annualizedVolatilityFromPerSecond(row.sigma) : null;
+    const annualizedSigma1m =
+      row.sigma1m !== null && row.sigma1m > 0 ? annualizedVolatilityFromPerSecond(row.sigma1m) : null;
+    const annualizedSigma5m =
+      row.sigma5m !== null && row.sigma5m > 0 ? annualizedVolatilityFromPerSecond(row.sigma5m) : null;
     const fairValueDeribitIv =
       perSecondDeribitVolatility !== null &&
       row.strikePrice !== null &&
@@ -171,6 +179,8 @@ function computeRows(
       binancePrice,
       yesTokenPrice,
       annualizedSigma,
+      annualizedSigma1m,
+      annualizedSigma5m,
       fairValueDeribitIv,
       fairValueBlendedSigma,
       f,
@@ -294,10 +304,16 @@ function toCsv(rows: ComputedReportRow[]): string {
     'iso_time',
     'ts',
     'published_at',
+    'chainlink_ts',
+    'binance_ts',
     'fair_value',
+    'fair_value_sigma_1m',
+    'fair_value_sigma_5m',
     'fair_value_blended_sigma',
     'confidence',
     'annualized_sigma',
+    'annualized_sigma_1m',
+    'annualized_sigma_5m',
     'fair_value_deribit_iv',
     'chainlink_price',
     'btc_price',
@@ -325,10 +341,16 @@ function toCsv(rows: ComputedReportRow[]): string {
       row.isoTime,
       String(row.ts),
       String(row.publishedAt),
+      String(row.chainlinkTs),
+      row.binanceTs !== null && row.binanceTs !== undefined ? String(row.binanceTs) : '',
       formatNum(row.fairValue),
+      formatMaybeNumber(row.fairValueSigma1m),
+      formatMaybeNumber(row.fairValueSigma5m),
       formatMaybeNumber(row.fairValueBlendedSigma),
       formatNum(row.confidence),
       formatMaybeNumber(row.annualizedSigma),
+      formatMaybeNumber(row.annualizedSigma1m),
+      formatMaybeNumber(row.annualizedSigma5m),
       formatMaybeNumber(row.fairValueDeribitIv),
       formatNum(row.chainlinkPrice, 2),
       row.binancePrice !== null ? formatNum(row.binancePrice, 2) : '',
@@ -398,6 +420,9 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
     '- `annualized_sigma(t) = sigma(t) * sqrt(60*60*24*365)` — EWMA σ from stored samples, annualized fraction (e.g. 0.40 = 40%).',
   );
   lines.push(
+    '- `annualized_sigma_1m` / `annualized_sigma_5m` use the same annualization, but sigma is estimated from 1-minute / 5-minute sampled Chainlink prices.',
+  );
+  lines.push(
     '- `fair_value_blended_sigma` is the binary-call fair value using blended volatility: annual σ = average(`annualized_sigma(t)`, Deribit `mark_iv` annual), converted to per-second for Black–Scholes; if only one source exists, that source is used.',
   );
   lines.push(
@@ -461,16 +486,17 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('## Rows');
   lines.push('');
   lines.push(
-    '| time | fair value | fair value (σ EWMA+Deribit) | annualized σ | fv deribit iv | chainlink | binance | yes bid | yes ask | no bid | no ask | tte ms | f (a) | g (a) | f-g (a) | f (b) | g (b) | f-g (b) | f (c) | g (c) | f-g (c) |',
+    '| time | chainlink ts | binance ts | fair value | fv sigma 1m | fv sigma 5m | fair value (σ EWMA+Deribit) | annualized σ | annualized σ 1m | annualized σ 5m | fv deribit iv | chainlink | binance | yes bid | yes ask | no bid | no ask | tte ms | f (a) | g (a) | f-g (a) | f (b) | g (b) | f-g (b) | f (c) | g (c) | f-g (c) |',
   );
   lines.push(
-    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   );
 
   for (const row of rows) {
     lines.push(
-      `| ${row.isoTime} | ${formatNum(row.fairValue)} | ${formatMaybeNumber(row.fairValueBlendedSigma)} | ` +
-        `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
+      `| ${row.isoTime} | ${row.chainlinkTs} | ${row.binanceTs ?? 'N/A'} | ${formatNum(row.fairValue)} | ` +
+        `${formatMaybeNumber(row.fairValueSigma1m)} | ${formatMaybeNumber(row.fairValueSigma5m)} | ${formatMaybeNumber(row.fairValueBlendedSigma)} | ` +
+        `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.annualizedSigma1m)} | ${formatMaybeNumber(row.annualizedSigma5m)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
         `${formatNum(row.chainlinkPrice, 2)} | ${formatMaybeNumber(row.binancePrice, 2) || 'N/A'} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
         `${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
         `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} | ` +

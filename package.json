@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "takerbot": "tsx takerbot/takerbot.ts",
     "takerbot:btcFeeder": "tsx takerbot/feeders/btcPriceFeeder.ts",
+    "takerbot:ccxt": "tsx takerbot/ccxt.ts",
     "takerbot:chainlinkFeeder": "tsx takerbot/feeders/chainlinkPriceFeeder.ts",
     "takerbot:priceReport": "tsx takerbot/tools/priceFeedPairReport.ts",
     "takerbot:marketRoundReport": "tsx takerbot/tools/generateMarketRoundReport.ts",
@@ -28,6 +29,7 @@
   },
   "dependencies": {
     "@superpredict/ccxt": "^0.1.0",
+    "ccxt": "^4.5.50",
     "dotenv": "^16.4.7",
     "ioredis": "^5.4.2",
     "ws": "^8.18.1"

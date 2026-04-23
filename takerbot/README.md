@@ -178,15 +178,18 @@ The generated report adds the following derived columns:
 ```text
 yes token price(t) = yes ask(t)
 f(t) = fair value(t) - yes token price(t)
-g(t) = (f(t) + f(t-1) + f(t-2) + f(t-3) + f(t-4)) / 5
+g(t) = average(f(t-1) ... f(t-10))
 f(t) - g(t)
 ```
 
 Notes:
 
-- `g(t)` is blank until 5 rows are available.
+- `g(t)` is blank until 10 prior rows are available.
 - `no bid` and `no ask` are currently synthesized from the yes-side book:
   `no bid = 1 - yes ask`, `no ask = 1 - yes bid`.
+- Report-row guardrail for anomalous top-of-book zeros: when `yes ask` (or `yes bid`) suddenly
+  collapses to `0` with a large jump versus the previous row, the updater rewrites that zero to
+  the opposite side (`yes ask = yes bid`, or `yes bid = yes ask`) before persisting the row.
 - Per-market report rows are stored in Redis with a 7-day TTL and capped at 5000 rows.
 
 ### Manual report generation
