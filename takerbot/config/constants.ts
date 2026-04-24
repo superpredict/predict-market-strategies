@@ -67,6 +67,12 @@ export const WS_RECONNECT_DELAY_MS = 3_000;
  */
 export const BTC_STALE_FORBID_MS = 30_000; // 30 seconds
 
+/**
+ * On the Chainlink Redis pub/sub path only: if wall clock minus payload
+ * `chainlinkTs` exceeds this, hard-forbid (orderbook-triggered path skips this).
+ */
+export const BTC_CHAINLINK_ORACLE_LAG_FORBID_MS = 2000;
+
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
 /** Set to true to enable verbose debug logs across all processes. */

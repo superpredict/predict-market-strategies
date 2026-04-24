@@ -16,10 +16,15 @@
  * Chainlink staleness guard:
  *   If the BTC feed is older than BTC_STALE_FORBID_MS, trading is hard-forbidden
  *   (early return). Confidence therefore only reflects time-to-expiry.
+ *
+ * Chainlink oracle lag guard (Chainlink pub/sub path only):
+ *   If now - chainlinkTs exceeds BTC_CHAINLINK_ORACLE_LAG_FORBID_MS, hard-forbid.
+ *   Skipped on orderbook-triggered runs so frequent book updates are not blocked.
  */
 
 import dotenv from 'dotenv';
 import {
+  BTC_CHAINLINK_ORACLE_LAG_FORBID_MS,
   BTC_STALE_FORBID_MS,
   MIN_CONFIDENCE,
   STOP_TRADING_BEFORE_EXPIRY_MS,
@@ -194,7 +199,8 @@ async function warmVolatilityEstimator(): Promise<void> {
 
 async function computeAndPublish(
   btcFeed: ChainlinkBtcPriceFeed,
-  obFeed: MarketOrderbookFeed
+  obFeed: MarketOrderbookFeed,
+  enforceChainlinkOracleLagForbid = false
 ): Promise<void> {
   if (!MARKET_ID) return;
 
@@ -208,6 +214,18 @@ async function computeAndPublish(
       `${BTC_STALE_FORBID_MS / 1000}s) — forbidden`
     );
     return;
+  }
+
+  // ── Oracle payload lag (Chainlink pub/sub path only) ───────────────────────
+  if (enforceChainlinkOracleLagForbid) {
+    const oracleLagMs = now - btcFeed.chainlinkTs;
+    if (oracleLagMs > BTC_CHAINLINK_ORACLE_LAG_FORBID_MS) {
+      console.log(
+        `[fairValueUpdater] CHAINLINK ORACLE LAG (${oracleLagMs}ms > ` +
+        `${BTC_CHAINLINK_ORACLE_LAG_FORBID_MS}ms, now−chainlinkTs) — forbidden`
+      );
+      return;
+    }
   }
 
   // ── Require a valid strike price ──────────────────────────────────────────
@@ -425,7 +443,7 @@ async function start(): Promise<void> {
             }
             const obFeed = await getOrderbook(MARKET_ID);
             if (!obFeed) return;
-            await computeAndPublish(btcFeed, obFeed);
+            await computeAndPublish(btcFeed, obFeed, true);
           } else if (channel === REDIS_CHANNELS.orderbookUpdated(MARKET_ID)) {
             const obFeed = JSON.parse(message) as MarketOrderbookFeed;
             const btcFeed = await getChainlinkBtcPrice();
