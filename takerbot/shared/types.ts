@@ -52,14 +52,18 @@ export interface MarketReportPoint {
   fairValue: number;
   confidence: number;
   sigma: number | null;
-  /** EWMA sigma computed from 1-minute Chainlink samples, in per-second units. */
-  sigma1m: number | null;
+  /** Legacy 1-minute sigma kept optional for backward compatibility. */
+  sigma1m?: number | null;
   /** EWMA sigma computed from 5-minute Chainlink samples, in per-second units. */
   sigma5m: number | null;
-  /** Fair value computed with sigma1m (same Black–Scholes contract). */
-  fairValueSigma1m: number | null;
+  /** EWMA sigma computed from 10-minute Chainlink samples, in per-second units. */
+  sigma10m: number | null;
   /** Fair value computed with sigma5m (same Black–Scholes contract). */
   fairValueSigma5m: number | null;
+  /** Legacy 1-minute fair value kept optional for backward compatibility. */
+  fairValueSigma1m?: number | null;
+  /** Fair value computed with sigma10m (same Black–Scholes contract). */
+  fairValueSigma10m: number | null;
   /** Chainlink BTC/USD spot used for the EWMA fair value model (S in Black–Scholes). */
   btcPrice: number;
   /** Chainlink payload timestamp (epoch ms) used by volatility estimator updates. */
@@ -68,6 +72,8 @@ export interface MarketReportPoint {
   binanceBtcPrice?: number | null;
   /** Binance source tick timestamp (epoch ms) from btcPriceFeeder payload. */
   binanceTs?: number | null;
+  /** Epoch ms when updater read Binance feed from Redis for this report row. */
+  binanceRedisTs?: number | null;
   strikePrice: number | null;
   timeToExpiryMs: number;
   yesBid: number;

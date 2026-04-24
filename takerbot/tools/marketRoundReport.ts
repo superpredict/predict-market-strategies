@@ -1,6 +1,7 @@
 import { access, mkdir, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { resolve } from 'node:path';
+import { MIN_CONFIDENCE, STOP_TRADING_BEFORE_EXPIRY_MS } from '../config/constants.js';
 import type { ActiveMarketInfo, MarketReportPoint } from '../shared/types.js';
 import {
   annualizedVolatilityFromPerSecond,
@@ -33,6 +34,8 @@ interface ComputedReportRow extends MarketReportPoint {
   annualizedSigma1m: number | null;
   /** Annualized volatility from 5-minute sampled EWMA sigma. */
   annualizedSigma5m: number | null;
+  /** Annualized volatility from 10-minute sampled EWMA sigma. */
+  annualizedSigma10m: number | null;
   /** Same Black–Scholes binary call as fair_value, but σ = Deribit mark_iv annualized. */
   fairValueDeribitIv: number | null;
   /**
@@ -44,10 +47,19 @@ interface ComputedReportRow extends MarketReportPoint {
   f: number;
   g: number | null;
   fMinusG: number | null;
+  fSigma5m: number | null;
+  gSigma5m: number | null;
+  fMinusGSigma5m: number | null;
   /** f/g/f−g from Deribit IV fair value (b). */
   fDeribitIv: number | null;
   gDeribitIv: number | null;
   fMinusGDeribitIv: number | null;
+  tradeSignalSigma5m: -1 | 0 | 1;
+  tradeSignalSigma10m: -1 | 0 | 1;
+  tradeSignalDeribitIv: -1 | 0 | 1;
+  fSigma10m: number | null;
+  gSigma10m: number | null;
+  fMinusGSigma10m: number | null;
   /** f/g/f−g from blended σ (mean EWMA + Deribit) fair value (c). */
   fMeanFv: number | null;
   gMeanFv: number | null;
@@ -79,8 +91,8 @@ function formatNum(value: number | null | undefined, digits = 6): string {
   return value.toFixed(digits);
 }
 
-function formatMaybeNumber(value: number | null, digits = 6): string {
-  return value === null ? '' : value.toFixed(digits);
+function formatMaybeNumber(value: number | null | undefined, digits = 6): string {
+  return value === null || value === undefined ? '' : value.toFixed(digits);
 }
 
 function fileExists(path: string): Promise<boolean> {
@@ -92,6 +104,12 @@ function fileExists(path: string): Promise<boolean> {
 
 /** g(t) = mean(f(t−1)…f(t−10)); clears history when the current f is null (no Deribit / blended FV). */
 const G_PRIOR_SAMPLES = 10;
+const SIGNAL_DELTA = 0.05;
+const SIGNAL_GAMMA = 0.03;
+const SIGNAL_MAX_YES_SPREAD = 0.08;
+const SIGNAL_SIGMA_MEDIAN_WINDOW = 31;
+const SIGNAL_SIGMA_MIN_RATIO = 0.35;
+const SIGNAL_SIGMA_MAX_RATIO = 3.5;
 
 function rollingGFromPriorF(
   pastF: number[],
@@ -111,14 +129,69 @@ function rollingGFromPriorF(
   return { g, fMinusG };
 }
 
+function median(xs: number[]): number {
+  if (xs.length === 0) return NaN;
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? (sorted[mid] ?? NaN)
+    : ((sorted[mid - 1] ?? NaN) + (sorted[mid] ?? NaN)) / 2;
+}
+
+function sigmaRegimeOk(
+  rows: ComputedReportRow[],
+  index: number,
+  sigmaKey: 'annualizedSigma5m' | 'annualizedSigma10m',
+): boolean {
+  const current = rows[index]?.[sigmaKey];
+  if (current === null || current === undefined || !Number.isFinite(current) || current <= 0) {
+    return false;
+  }
+  const from = Math.max(0, index - SIGNAL_SIGMA_MEDIAN_WINDOW + 1);
+  const history: number[] = [];
+  for (let i = from; i <= index; i++) {
+    const value = rows[i]?.[sigmaKey];
+    if (value !== null && value !== undefined && Number.isFinite(value) && value > 0) history.push(value);
+  }
+  const minSamples = Math.min(5, Math.max(3, Math.floor(SIGNAL_SIGMA_MEDIAN_WINDOW / 6)));
+  if (history.length < minSamples) return false;
+  const med = median(history);
+  if (!Number.isFinite(med) || med <= 0) return false;
+  return current >= med * SIGNAL_SIGMA_MIN_RATIO && current <= med * SIGNAL_SIGMA_MAX_RATIO;
+}
+
+function computeTradeSignal(
+  row: ComputedReportRow,
+  f: number | null,
+  fMinusG: number | null,
+  sigmaRegimePass: boolean,
+): -1 | 0 | 1 {
+  if (f === null || fMinusG === null) return 0;
+  const spread = row.yesAsk - row.yesBid;
+  const spreadOk =
+    row.yesBid > 0 &&
+    Number.isFinite(row.yesBid) &&
+    Number.isFinite(spread) &&
+    spread >= 0 &&
+    spread <= SIGNAL_MAX_YES_SPREAD;
+  const confOk = Number.isFinite(row.confidence) && row.confidence >= MIN_CONFIDENCE;
+  const tteOk = Number.isFinite(row.timeToExpiryMs) && row.timeToExpiryMs > STOP_TRADING_BEFORE_EXPIRY_MS;
+  if (!spreadOk || !confOk || !tteOk || !sigmaRegimePass) return 0;
+  if (f >= SIGNAL_DELTA && fMinusG >= SIGNAL_GAMMA) return 1;
+  if (f <= -SIGNAL_DELTA && fMinusG <= -SIGNAL_GAMMA) return -1;
+  return 0;
+}
+
 function computeRows(
   rows: MarketReportPoint[],
   deribitAnnualVolatility: number | null,
 ): ComputedReportRow[] {
   const computed: ComputedReportRow[] = [];
   const pastPrimaryF: number[] = [];
+  const pastSigma5mF: number[] = [];
   const pastDeribitF: number[] = [];
   const pastMeanFvF: number[] = [];
+  const pastSigma10mF: number[] = [];
   const perSecondDeribitVolatility =
     deribitAnnualVolatility !== null ? perSecondVolatilityFromAnnual(deribitAnnualVolatility) : null;
 
@@ -126,13 +199,22 @@ function computeRows(
     const yesTokenPrice = row.yesAsk;
     const f = row.fairValue - yesTokenPrice;
     const { g, fMinusG } = rollingGFromPriorF(pastPrimaryF, f);
+    const fSigma5m =
+      row.fairValueSigma5m !== null && row.fairValueSigma5m !== undefined
+        ? row.fairValueSigma5m - yesTokenPrice
+        : null;
+    const { g: gSigma5m, fMinusG: fMinusGSigma5m } = rollingGFromPriorF(pastSigma5mF, fSigma5m);
 
     const annualizedSigma =
       row.sigma !== null && row.sigma > 0 ? annualizedVolatilityFromPerSecond(row.sigma) : null;
     const annualizedSigma1m =
-      row.sigma1m !== null && row.sigma1m > 0 ? annualizedVolatilityFromPerSecond(row.sigma1m) : null;
+      row.sigma1m !== null && row.sigma1m !== undefined && row.sigma1m > 0
+        ? annualizedVolatilityFromPerSecond(row.sigma1m)
+        : null;
     const annualizedSigma5m =
       row.sigma5m !== null && row.sigma5m > 0 ? annualizedVolatilityFromPerSecond(row.sigma5m) : null;
+    const annualizedSigma10m =
+      row.sigma10m !== null && row.sigma10m > 0 ? annualizedVolatilityFromPerSecond(row.sigma10m) : null;
     const fairValueDeribitIv =
       perSecondDeribitVolatility !== null &&
       row.strikePrice !== null &&
@@ -167,6 +249,11 @@ function computeRows(
     const fMeanFv =
       fairValueBlendedSigma !== null ? fairValueBlendedSigma - yesTokenPrice : null;
     const { g: gMeanFv, fMinusG: fMinusGMeanFv } = rollingGFromPriorF(pastMeanFvF, fMeanFv);
+    const fSigma10m =
+      row.fairValueSigma10m !== null && row.fairValueSigma10m !== undefined
+        ? row.fairValueSigma10m - yesTokenPrice
+        : null;
+    const { g: gSigma10m, fMinusG: fMinusGSigma10m } = rollingGFromPriorF(pastSigma10mF, fSigma10m);
 
     const binancePrice =
       row.binanceBtcPrice !== undefined && row.binanceBtcPrice !== null ? row.binanceBtcPrice : null;
@@ -181,18 +268,48 @@ function computeRows(
       annualizedSigma,
       annualizedSigma1m,
       annualizedSigma5m,
+      annualizedSigma10m,
       fairValueDeribitIv,
       fairValueBlendedSigma,
       f,
       g,
       fMinusG,
+      fSigma5m,
+      gSigma5m,
+      fMinusGSigma5m,
       fDeribitIv,
       gDeribitIv,
       fMinusGDeribitIv,
       fMeanFv,
       gMeanFv,
       fMinusGMeanFv,
+      tradeSignalSigma5m: 0,
+      tradeSignalSigma10m: 0,
+      tradeSignalDeribitIv: 0,
+      fSigma10m,
+      gSigma10m,
+      fMinusGSigma10m,
     });
+  }
+
+  for (let i = 0; i < computed.length; i++) {
+    const row = computed[i];
+    if (!row) continue;
+    const sigma5mPass = sigmaRegimeOk(computed, i, 'annualizedSigma5m');
+    const sigma10mPass = sigmaRegimeOk(computed, i, 'annualizedSigma10m');
+    row.tradeSignalSigma5m = computeTradeSignal(row, row.fSigma5m, row.fMinusGSigma5m, sigma5mPass);
+    row.tradeSignalSigma10m = computeTradeSignal(
+      row,
+      row.fSigma10m,
+      row.fMinusGSigma10m,
+      sigma10mPass,
+    );
+    row.tradeSignalDeribitIv = computeTradeSignal(
+      row,
+      row.fDeribitIv,
+      row.fMinusGDeribitIv,
+      sigma5mPass,
+    );
   }
 
   return computed;
@@ -302,75 +419,71 @@ function computeSummary(rows: ComputedReportRow[]) {
 function toCsv(rows: ComputedReportRow[]): string {
   const header = [
     'iso_time',
-    'ts',
-    'published_at',
     'chainlink_ts',
     'binance_ts',
-    'fair_value',
-    'fair_value_sigma_1m',
-    'fair_value_sigma_5m',
-    'fair_value_blended_sigma',
-    'confidence',
-    'annualized_sigma',
-    'annualized_sigma_1m',
-    'annualized_sigma_5m',
-    'fair_value_deribit_iv',
-    'chainlink_price',
-    'btc_price',
+    'binance_redis_ts',
+    'fair_value_redis_ts',
+    'time_to_expiry_ms',
+    'time_to_expiry_sec',
     'strike_price',
+    'chainlink_price',
+    'binance_btcusdc_price',
+    'annualized_sigma_5m',
+    'annualized_sigma_10m',
+    'fair_value_sigma_5m',
+    'fair_value_sigma_10m',
+    'fair_value_deribit_iv',
     'yes_bid',
     'yes_ask',
     'no_bid',
     'no_ask',
-    'time_to_expiry_ms',
-    'time_to_expiry_sec',
-    'yes_token_price',
-    'f',
-    'g',
-    'f_minus_g',
+    'f_sigma_5m',
+    'g_sigma_5m',
+    'f_minus_g_sigma_5m',
+    'trade_signal_sigma_5m',
+    'f_sigma_10m',
+    'g_sigma_10m',
+    'f_minus_g_sigma_10m',
+    'trade_signal_sigma_10m',
     'f_deribit_iv',
     'g_deribit_iv',
     'f_minus_g_deribit_iv',
-    'f_mean_fv',
-    'g_mean_fv',
-    'f_minus_g_mean_fv',
+    'trade_signal_deribit_iv',
   ];
 
   const lines = rows.map((row) =>
     [
       row.isoTime,
-      String(row.ts),
-      String(row.publishedAt),
       String(row.chainlinkTs),
       row.binanceTs !== null && row.binanceTs !== undefined ? String(row.binanceTs) : '',
-      formatNum(row.fairValue),
-      formatMaybeNumber(row.fairValueSigma1m),
-      formatMaybeNumber(row.fairValueSigma5m),
-      formatMaybeNumber(row.fairValueBlendedSigma),
-      formatNum(row.confidence),
-      formatMaybeNumber(row.annualizedSigma),
-      formatMaybeNumber(row.annualizedSigma1m),
-      formatMaybeNumber(row.annualizedSigma5m),
-      formatMaybeNumber(row.fairValueDeribitIv),
+      row.binanceRedisTs !== null && row.binanceRedisTs !== undefined ? String(row.binanceRedisTs) : '',
+      String(row.publishedAt),
+      String(row.timeToExpiryMs),
+      String(Math.round(row.timeToExpiryMs / 1000)),
+      formatMaybeNumber(row.strikePrice, 2),
       formatNum(row.chainlinkPrice, 2),
       row.binancePrice !== null ? formatNum(row.binancePrice, 2) : '',
-      formatMaybeNumber(row.strikePrice, 2),
+      formatMaybeNumber(row.annualizedSigma5m),
+      formatMaybeNumber(row.annualizedSigma10m),
+      formatMaybeNumber(row.fairValueSigma5m),
+      formatMaybeNumber(row.fairValueSigma10m),
+      formatMaybeNumber(row.fairValueDeribitIv),
       formatNum(row.yesBid),
       formatNum(row.yesAsk),
       formatNum(row.noBid),
       formatNum(row.noAsk),
-      String(row.timeToExpiryMs),
-      String(Math.round(row.timeToExpiryMs / 1000)),
-      formatNum(row.yesTokenPrice),
-      formatNum(row.f),
-      formatMaybeNumber(row.g),
-      formatMaybeNumber(row.fMinusG),
+      formatMaybeNumber(row.fSigma5m),
+      formatMaybeNumber(row.gSigma5m),
+      formatMaybeNumber(row.fMinusGSigma5m),
+      String(row.tradeSignalSigma5m),
+      formatMaybeNumber(row.fSigma10m),
+      formatMaybeNumber(row.gSigma10m),
+      formatMaybeNumber(row.fMinusGSigma10m),
+      String(row.tradeSignalSigma10m),
       formatMaybeNumber(row.fDeribitIv),
       formatMaybeNumber(row.gDeribitIv),
       formatMaybeNumber(row.fMinusGDeribitIv),
-      formatMaybeNumber(row.fMeanFv),
-      formatMaybeNumber(row.gMeanFv),
-      formatMaybeNumber(row.fMinusGMeanFv),
+      String(row.tradeSignalDeribitIv),
     ].join(','),
   );
 
@@ -410,33 +523,22 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('## Formula Notes');
   lines.push('');
   lines.push(
-    '- `chainlink_price(t)` is the Chainlink BTC/USD spot used as **S** in the EWMA-σ fair value model.',
+    '- `chainlink_price(t)` is diagnostic spot; fair value in this report uses Binance as **S**.',
   );
   lines.push(
-    '- `btc_price(t)` is the Binance book-ticker **mid** at the same sample time (diagnostics / settlement proxy in downstream tools).',
-  );
-  lines.push('- `yes token price(t)` uses `yes ask`.');
-  lines.push(
-    '- `annualized_sigma(t) = sigma(t) * sqrt(60*60*24*365)` — EWMA σ from stored samples, annualized fraction (e.g. 0.40 = 40%).',
+    '- `binance_btcusdc_price(t)` is Binance book-ticker **mid** used as **S** in `fair_value_sigma_5m`, `fair_value_sigma_10m`, and `fair_value_deribit_iv`.',
   );
   lines.push(
-    '- `annualized_sigma_1m` / `annualized_sigma_5m` use the same annualization, but sigma is estimated from 1-minute / 5-minute sampled Chainlink prices.',
+    '- `annualized_sigma_5m` / `annualized_sigma_10m` are annualized EWMA sigma from 5-minute / 10-minute Chainlink samples.',
   );
   lines.push(
-    '- `fair_value_blended_sigma` is the binary-call fair value using blended volatility: annual σ = average(`annualized_sigma(t)`, Deribit `mark_iv` annual), converted to per-second for Black–Scholes; if only one source exists, that source is used.',
+    '- `f_sigma_5m = fair_value_sigma_5m - yes_ask`, `f_sigma_10m = fair_value_sigma_10m - yes_ask`, `f_deribit_iv = fair_value_deribit_iv - yes_ask`.',
   );
   lines.push(
-    '- `fair_value_deribit_iv` is the binary-call fair value using only Deribit `mark_iv` annualized volatility from market discovery.',
-  );
-  lines.push('- `f(t) = fair value(t) - yes token price(t)` — self EWMA σ fair value (a).');
-  lines.push(
-    '- `g(t) = (1/10) * sum(f(t-k), k=1..10)` — average of the **previous** 10 `f` samples; blank until 10 prior rows exist.',
+    '- For each track, `g` is the mean of previous 10 `f` samples and `f_minus_g = f - g`.',
   );
   lines.push(
-    '- **(b)** `f_deribit_iv` / `g_deribit_iv` / `f_minus_g_deribit_iv` (CSV): same lag-10 `g` rule but `f` uses `fair_value_deribit_iv − yes_ask`. History clears after any row where Deribit FV is missing.',
-  );
-  lines.push(
-    '- **(c)** `f_mean_fv` / `g_mean_fv` / `f_minus_g_mean_fv` (CSV): same lag-10 `g` using `fair_value_blended_sigma − yes_ask`. History clears when blended FV is missing.',
+    '- `trade_signal_*` values are `1` (buy), `-1` (short), `0` (no trade), using the same conditions as backtest logic.',
   );
   lines.push('');
   lines.push('## Summary');
@@ -486,23 +588,23 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('## Rows');
   lines.push('');
   lines.push(
-    '| time | chainlink ts | binance ts | fair value | fv sigma 1m | fv sigma 5m | fair value (σ EWMA+Deribit) | annualized σ | annualized σ 1m | annualized σ 5m | fv deribit iv | chainlink | binance | yes bid | yes ask | no bid | no ask | tte ms | f (a) | g (a) | f-g (a) | f (b) | g (b) | f-g (b) | f (c) | g (c) | f-g (c) |',
+    '| iso time | chainlink ts | binance ts | binance redis ts | fair value redis ts | tte ms | tte sec | strike | chainlink | binance | ann sigma 5m | ann sigma 10m | fv sigma 5m | fv sigma 10m | fv deribit iv | yes bid | yes ask | no bid | no ask | f sigma 5m | g sigma 5m | f-g sigma 5m | signal sigma 5m | f sigma 10m | g sigma 10m | f-g sigma 10m | signal sigma 10m | f deribit iv | g deribit iv | f-g deribit iv | signal deribit iv |',
   );
   lines.push(
-    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
   );
 
   for (const row of rows) {
     lines.push(
-      `| ${row.isoTime} | ${row.chainlinkTs} | ${row.binanceTs ?? 'N/A'} | ${formatNum(row.fairValue)} | ` +
-        `${formatMaybeNumber(row.fairValueSigma1m)} | ${formatMaybeNumber(row.fairValueSigma5m)} | ${formatMaybeNumber(row.fairValueBlendedSigma)} | ` +
-        `${formatMaybeNumber(row.annualizedSigma)} | ${formatMaybeNumber(row.annualizedSigma1m)} | ${formatMaybeNumber(row.annualizedSigma5m)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
-        `${formatNum(row.chainlinkPrice, 2)} | ${formatMaybeNumber(row.binancePrice, 2) || 'N/A'} | ${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ` +
-        `${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ${row.timeToExpiryMs} | ${formatNum(row.f)} | ` +
-        `${formatMaybeNumber(row.g)} | ${formatMaybeNumber(row.fMinusG)} | ` +
-        `${formatMaybeNumber(row.fDeribitIv)} | ${formatMaybeNumber(row.gDeribitIv)} | ` +
-        `${formatMaybeNumber(row.fMinusGDeribitIv)} | ${formatMaybeNumber(row.fMeanFv)} | ` +
-        `${formatMaybeNumber(row.gMeanFv)} | ${formatMaybeNumber(row.fMinusGMeanFv)} |`,
+      `| ${row.isoTime} | ${row.chainlinkTs} | ${row.binanceTs ?? 'N/A'} | ${row.binanceRedisTs ?? 'N/A'} | ${row.publishedAt} | ` +
+        `${row.timeToExpiryMs} | ${Math.round(row.timeToExpiryMs / 1000)} | ${formatMaybeNumber(row.strikePrice, 2)} | ` +
+        `${formatNum(row.chainlinkPrice, 2)} | ${formatMaybeNumber(row.binancePrice, 2) || 'N/A'} | ` +
+        `${formatMaybeNumber(row.annualizedSigma5m)} | ${formatMaybeNumber(row.annualizedSigma10m)} | ` +
+        `${formatMaybeNumber(row.fairValueSigma5m)} | ${formatMaybeNumber(row.fairValueSigma10m)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
+        `${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ` +
+        `${formatMaybeNumber(row.fSigma5m)} | ${formatMaybeNumber(row.gSigma5m)} | ${formatMaybeNumber(row.fMinusGSigma5m)} | ${row.tradeSignalSigma5m} | ` +
+        `${formatMaybeNumber(row.fSigma10m)} | ${formatMaybeNumber(row.gSigma10m)} | ${formatMaybeNumber(row.fMinusGSigma10m)} | ${row.tradeSignalSigma10m} | ` +
+        `${formatMaybeNumber(row.fDeribitIv)} | ${formatMaybeNumber(row.gDeribitIv)} | ${formatMaybeNumber(row.fMinusGDeribitIv)} | ${row.tradeSignalDeribitIv} |`,
     );
   }
 

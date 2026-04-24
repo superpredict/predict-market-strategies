@@ -9,7 +9,7 @@
  *   FV = clamp( N(d2), 0.01, 0.99 )
  *   d2 = [ln(S/K) - (σ^2 / 2) * T] / (σ × √T)
  *   K = strike price from marketDiscovery for the active 15-min window
- *   S = current Chainlink BTC/USD price
+ *   S = current Binance BTC/USDC price
  *   T = time-to-expiry in seconds
  *   σ = per-second EWMA volatility from Chainlink tick data
  *
@@ -69,18 +69,18 @@ const volatilityEstimator = new EWMAVolatility({
   lambda: VOLATILITY_EWMA_LAMBDA,
   minTicks: VOLATILITY_MIN_TICKS,
 });
-const volatilityEstimator1m = new EWMAVolatility({
+const volatilityEstimator5m = new EWMAVolatility({
   lambda: VOLATILITY_EWMA_LAMBDA,
   minTicks: VOLATILITY_MIN_TICKS,
 });
-const volatilityEstimator5m = new EWMAVolatility({
+const volatilityEstimator10m = new EWMAVolatility({
   lambda: VOLATILITY_EWMA_LAMBDA,
   minTicks: VOLATILITY_MIN_TICKS,
 });
 let sigmaNotReadyLogged = false;
 const ZERO_PRICE_ANOMALY_JUMP = 0.2;
-const ONE_MINUTE_MS = 60_000;
 const FIVE_MINUTES_MS = 5 * 60_000;
+const TEN_MINUTES_MS = 10 * 60_000;
 
 class CoarseChainlinkSampler {
   private readonly intervalMs: number;
@@ -112,8 +112,8 @@ class CoarseChainlinkSampler {
   }
 }
 
-const chainlinkSampler1m = new CoarseChainlinkSampler(ONE_MINUTE_MS);
 const chainlinkSampler5m = new CoarseChainlinkSampler(FIVE_MINUTES_MS);
+const chainlinkSampler10m = new CoarseChainlinkSampler(TEN_MINUTES_MS);
 
 function clampOutcomePrice(value: number): number {
   return Math.min(1, Math.max(0, value));
@@ -179,24 +179,24 @@ async function warmVolatilityEstimator(): Promise<void> {
 
   const sigma = volatilityEstimator.warmFromChainlinkHistory(history);
   for (const tick of [...history].sort((a, b) => a.chainlinkTs - b.chainlinkTs)) {
-    const sampled1m = chainlinkSampler1m.update(tick.price, tick.chainlinkTs);
-    if (sampled1m !== null) {
-      const sampled1mTs = Math.floor(tick.chainlinkTs / ONE_MINUTE_MS) * ONE_MINUTE_MS;
-      volatilityEstimator1m.update(sampled1m, sampled1mTs);
-    }
     const sampled5m = chainlinkSampler5m.update(tick.price, tick.chainlinkTs);
     if (sampled5m !== null) {
       const sampled5mTs = Math.floor(tick.chainlinkTs / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
       volatilityEstimator5m.update(sampled5m, sampled5mTs);
     }
+    const sampled10m = chainlinkSampler10m.update(tick.price, tick.chainlinkTs);
+    if (sampled10m !== null) {
+      const sampled10mTs = Math.floor(tick.chainlinkTs / TEN_MINUTES_MS) * TEN_MINUTES_MS;
+      volatilityEstimator10m.update(sampled10m, sampled10mTs);
+    }
   }
-  const sigma1m = getCurrentSigmaFrom(volatilityEstimator1m);
   const sigma5m = getCurrentSigmaFrom(volatilityEstimator5m);
+  const sigma10m = getCurrentSigmaFrom(volatilityEstimator10m);
   console.log(
     `[fairValueUpdater] warmed EWMA sigma=${sigma.toExponential(3)} ` +
     `from ${history.length} Chainlink ticks ` +
-    `(sigma1m=${sigma1m !== null ? sigma1m.toExponential(3) : 'n/a'}, ` +
-    `sigma5m=${sigma5m !== null ? sigma5m.toExponential(3) : 'n/a'})`
+    `(sigma5m=${sigma5m !== null ? sigma5m.toExponential(3) : 'n/a'}, ` +
+    `sigma10m=${sigma10m !== null ? sigma10m.toExponential(3) : 'n/a'})`
   );
 }
 
@@ -211,11 +211,17 @@ async function computeAndPublish(
 
   const now = Date.now();
 
-  // ── Hard-forbid on stale Chainlink BTC ────────────────────────────────────
-  const btcAgeMs = now - btcFeed.ts;
+  const binanceFeed = await getBtcPrice();
+  if (!binanceFeed) {
+    if (VERBOSE) console.log('[fairValueUpdater] no Binance BTC feed in Redis — forbidden');
+    return;
+  }
+
+  // ── Hard-forbid on stale Binance BTC ──────────────────────────────────────
+  const btcAgeMs = now - binanceFeed.ts;
   if (btcAgeMs > BTC_STALE_FORBID_MS) {
     console.log(
-      `[fairValueUpdater] STALE CHAINLINK BTC (${(btcAgeMs / 1000).toFixed(1)}s > ` +
+      `[fairValueUpdater] STALE BINANCE BTC (${(btcAgeMs / 1000).toFixed(1)}s > ` +
       `${BTC_STALE_FORBID_MS / 1000}s) — forbidden`
     );
     return;
@@ -258,29 +264,29 @@ async function computeAndPublish(
   sigmaNotReadyLogged = false;
 
   const value = computeBaseFairValue({
-    currentPrice: btcFeed.price,
+    currentPrice: binanceFeed.price,
     strikePrice: STRIKE_PRICE,
     timeToExpiryMs,
     perSecondVolatility: sigmaPerSecond,
   });
-  const sigma1m = getCurrentSigmaFrom(volatilityEstimator1m);
   const sigma5m = getCurrentSigmaFrom(volatilityEstimator5m);
-  const fairValueSigma1m =
-    sigma1m !== null
-      ? computeBaseFairValue({
-          currentPrice: btcFeed.price,
-          strikePrice: STRIKE_PRICE,
-          timeToExpiryMs,
-          perSecondVolatility: sigma1m,
-        })
-      : null;
+  const sigma10m = getCurrentSigmaFrom(volatilityEstimator10m);
   const fairValueSigma5m =
     sigma5m !== null
       ? computeBaseFairValue({
-          currentPrice: btcFeed.price,
+          currentPrice: binanceFeed.price,
           strikePrice: STRIKE_PRICE,
           timeToExpiryMs,
           perSecondVolatility: sigma5m,
+        })
+      : null;
+  const fairValueSigma10m =
+    sigma10m !== null
+      ? computeBaseFairValue({
+          currentPrice: binanceFeed.price,
+          strikePrice: STRIKE_PRICE,
+          timeToExpiryMs,
+          perSecondVolatility: sigma10m,
         })
       : null;
   const { confidence, timeBonus, atFloor } = computeFairValueConfidence(
@@ -311,7 +317,7 @@ async function computeAndPublish(
     marketId: MARKET_ID,
     value,
     confidence,
-    btcPrice: btcFeed.price,
+    btcPrice: binanceFeed.price,
     strikePrice: STRIKE_PRICE,
     timeToExpiryMs,
     publishedAt: now,
@@ -326,18 +332,18 @@ async function computeAndPublish(
     trigger === 'orderbook' && reportOracleLagMs > BTC_CHAINLINK_ORACLE_LAG_FORBID_MS;
 
   if (!skipMarketReportForOracleLag) {
-    const binanceFeed = await getBtcPrice();
     await appendMarketReportRow({
       marketId: MARKET_ID,
       fairValue: value,
       confidence,
       sigma: sigmaPerSecond,
-      sigma1m,
       sigma5m,
+      sigma10m,
       btcPrice: btcFeed.price,
       chainlinkTs: btcFeed.chainlinkTs,
       binanceBtcPrice: binanceFeed !== null ? binanceFeed.price : null,
       binanceTs: binanceFeed !== null ? binanceFeed.ts : null,
+      binanceRedisTs: now,
       strikePrice: STRIKE_PRICE,
       timeToExpiryMs,
       yesBid,
@@ -346,8 +352,8 @@ async function computeAndPublish(
       noAsk: clampOutcomePrice(1 - yesBid),
       publishedAt: now,
       ts: now,
-      fairValueSigma1m,
       fairValueSigma5m,
+      fairValueSigma10m,
     });
   } else if (VERBOSE) {
     console.log(
@@ -362,17 +368,17 @@ async function computeAndPublish(
   const redis = getRedisClient();
   await redis.publish(REDIS_CHANNELS.fairValueUpdated(MARKET_ID), JSON.stringify(fv));
 
-  console.log(
-    `[fairValueUpdater] STRIKE FV=${(value * 100).toFixed(2)}% ` +
-    `conf=${(confidence * 100).toFixed(0)}% ` +
-    `sigma=${sigmaPerSecond.toExponential(3)} ` +
-    `sigma1m=${sigma1m !== null ? sigma1m.toExponential(3) : 'n/a'} ` +
-    `sigma5m=${sigma5m !== null ? sigma5m.toExponential(3) : 'n/a'} ` +
-    `chainlink=$${btcFeed.price.toFixed(2)} ` +
-    `strike=$${STRIKE_PRICE.toFixed(2)} ` +
-      `yesBid=${yesBid.toFixed(4)} yesAsk=${yesAsk.toFixed(4)} ` +
-    `tte=${Math.round(timeToExpiryMs / 1000)}s`
-  );
+  // console.log(
+  //   `[fairValueUpdater] STRIKE FV=${(value * 100).toFixed(2)}% ` +
+  //   `conf=${(confidence * 100).toFixed(0)}% ` +
+  //   `sigma=${sigmaPerSecond.toExponential(3)} ` +
+  //   `sigma5m=${sigma5m !== null ? sigma5m.toExponential(3) : 'n/a'} ` +
+  //   `sigma10m=${sigma10m !== null ? sigma10m.toExponential(3) : 'n/a'} ` +
+  //   `chainlink=$${btcFeed.price.toFixed(2)} binance=$${binanceFeed.price.toFixed(2)} ` +
+  //   `strike=$${STRIKE_PRICE.toFixed(2)} ` +
+  //     `yesBid=${yesBid.toFixed(4)} yesAsk=${yesAsk.toFixed(4)} ` +
+  //   `tte=${Math.round(timeToExpiryMs / 1000)}s`
+  // );
 }
 
 // ─── Market Rotation ─────────────────────────────────────────────────────────
@@ -449,15 +455,15 @@ async function start(): Promise<void> {
           if (channel === chainlinkChannel) {
             const btcFeed = JSON.parse(message) as ChainlinkBtcPriceFeed;
             volatilityEstimator.update(btcFeed.price, btcFeed.chainlinkTs);
-            const sampled1m = chainlinkSampler1m.update(btcFeed.price, btcFeed.chainlinkTs);
-            if (sampled1m !== null) {
-              const sampled1mTs = Math.floor(btcFeed.chainlinkTs / ONE_MINUTE_MS) * ONE_MINUTE_MS;
-              volatilityEstimator1m.update(sampled1m, sampled1mTs);
-            }
             const sampled5m = chainlinkSampler5m.update(btcFeed.price, btcFeed.chainlinkTs);
             if (sampled5m !== null) {
               const sampled5mTs = Math.floor(btcFeed.chainlinkTs / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
               volatilityEstimator5m.update(sampled5m, sampled5mTs);
+            }
+            const sampled10m = chainlinkSampler10m.update(btcFeed.price, btcFeed.chainlinkTs);
+            if (sampled10m !== null) {
+              const sampled10mTs = Math.floor(btcFeed.chainlinkTs / TEN_MINUTES_MS) * TEN_MINUTES_MS;
+              volatilityEstimator10m.update(sampled10m, sampled10mTs);
             }
             const obFeed = await getOrderbook(MARKET_ID);
             if (!obFeed) return;

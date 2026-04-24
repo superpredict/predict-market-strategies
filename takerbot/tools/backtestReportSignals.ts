@@ -13,14 +13,15 @@
 
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { STOP_TRADING_BEFORE_EXPIRY_MS } from '../config/constants.js';
 
 const REPORTS_DIR = resolve(process.cwd(), 'takerbot', 'reports');
 
 const DEFAULT_DELTA = 0.05;
 const DEFAULT_GAMMA = 0.03;
 const DEFAULT_MIN_CONFIDENCE = 0.18;
-/** Require more than this many ms remaining (default 3 minutes). */
-const DEFAULT_MIN_TIME_TO_EXPIRY_MS = 3 * 60 * 1000;
+/** Require more than this many ms remaining (default 1 minute). */
+const DEFAULT_MIN_TIME_TO_EXPIRY_MS = STOP_TRADING_BEFORE_EXPIRY_MS;
 /** Max YES ask − bid (probability units) to treat book as tight enough. */
 const DEFAULT_MAX_YES_SPREAD = 0.08;
 /** Max cumulative long YES shares per market (and max short shares); fixed band is ±20 by default. */
@@ -165,7 +166,7 @@ function parseCsv(content: string): CsvRow[] {
     ts: idx('ts'),
     fv: idx('fair_value'),
     cl: idx('chainlink_price'),
-    btc: idxOpt('btc_price'),
+    btc: idxOpt('binance_btcusdc_price'),
     strike: idx('strike_price'),
     bid: idx('yes_bid'),
     ask: idx('yes_ask'),
@@ -174,7 +175,7 @@ function parseCsv(content: string): CsvRow[] {
     fg: idx('f_minus_g_deribit_iv'),
     conf: idxOpt('confidence'),
     tte: idxOpt('time_to_expiry_ms'),
-    sig: idxOpt('annualized_sigma'),
+    sig: idxOpt('annualized_sigma_5m'),
   };
 
   const rows: CsvRow[] = [];

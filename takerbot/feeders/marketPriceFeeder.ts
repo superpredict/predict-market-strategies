@@ -214,11 +214,11 @@ async function handleOrderbookUpdate(
   // 3. Depth-surge detection
   await updateDepthPressure(marketId, bids.length, asks.length);
 
-  console.log(
-    `[marketPriceFeeder] ${marketId.slice(0, 10)}… ` +
-    `bid=${bestBid.toFixed(3)} ask=${bestAsk.toFixed(3)} ` +
-    `(depth: ${bids.length} bids, ${asks.length} asks)`
-  );
+  // console.log(
+  //   `[marketPriceFeeder] ${marketId.slice(0, 10)}… ` +
+  //   `bid=${bestBid.toFixed(3)} ask=${bestAsk.toFixed(3)} ` +
+  //   `(depth: ${bids.length} bids, ${asks.length} asks)`
+  // );
 }
 
 // ─── Market switching ─────────────────────────────────────────────────────────

@@ -107,10 +107,10 @@ async function handleTicker(ticker: BinanceTicker): Promise<void> {
   lastPublishedBid = pendingBid;
   lastPublishedAsk = pendingAsk;
 
-  console.log(
-    `[btcPriceFeeder] BTC/USD $${price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ` +
-    `bid=${pendingBid.toFixed(2)} ask=${pendingAsk.toFixed(2)} (ws_ms: ${Math.floor(feed.ts / 1000) * 1000})`
-  );
+  // console.log(
+  //   `[btcPriceFeeder] BTC/USD $${price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ` +
+  //   `bid=${pendingBid.toFixed(2)} ask=${pendingAsk.toFixed(2)} (ws_ms: ${Math.floor(feed.ts / 1000) * 1000})`
+  // );
 }
 
 async function start(): Promise<void> {

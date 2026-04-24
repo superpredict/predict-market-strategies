@@ -160,10 +160,10 @@ async function handleMessage(raw: string): Promise<void> {
   }
 
   const boundaryTag = isBoundary ? ' ★ 15-MIN BOUNDARY (STRIKE PRICE)' : '';
-  console.log(
-    `[chainlinkPriceFeeder] Chainlink BTC/USD $${price.toLocaleString()} ` +
-    `(chainlink ts: ${chainlinkTs})${binanceTag}${boundaryTag}`
-  );
+  // console.log(
+  //   `[chainlinkPriceFeeder] Chainlink BTC/USD $${price.toLocaleString()} ` +
+  //   `(chainlink ts: ${chainlinkTs})${binanceTag}${boundaryTag}`
+  // );
 }
 
 // ─── Shutdown ─────────────────────────────────────────────────────────────────

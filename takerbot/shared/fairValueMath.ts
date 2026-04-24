@@ -102,6 +102,9 @@ export interface ConfidenceResult {
   atFloor: boolean;
 }
 
+/** Time-to-expiry threshold where raw confidence reaches MIN_CONFIDENCE (60s). */
+const MIN_CONFIDENCE_TTE_MS = 60_000;
+
 /**
  * Confidence score based only on time-to-expiry.
  */
@@ -109,7 +112,7 @@ export function computeFairValueConfidence(
   timeToExpiryMs: number,
   minConfidence: number
 ): ConfidenceResult {
-  const timeBonus = Math.min(1, timeToExpiryMs / 1_000_000);
+  const timeBonus = Math.min(1, (timeToExpiryMs / MIN_CONFIDENCE_TTE_MS) * minConfidence);
   const rawScore = timeBonus;
   const confidence = Math.max(minConfidence, rawScore);
 
