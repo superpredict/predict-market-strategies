@@ -17,9 +17,10 @@
  *   If the BTC feed is older than BTC_STALE_FORBID_MS, trading is hard-forbidden
  *   (early return). Confidence therefore only reflects time-to-expiry.
  *
- * Chainlink oracle lag guard (Chainlink pub/sub path only):
- *   If now - chainlinkTs exceeds BTC_CHAINLINK_ORACLE_LAG_FORBID_MS, hard-forbid.
- *   Skipped on orderbook-triggered runs so frequent book updates are not blocked.
+ * Chainlink oracle lag (BTC_CHAINLINK_ORACLE_LAG_FORBID_MS):
+ *   Chainlink pub/sub: if now - chainlinkTs exceeds limit, hard-forbid entire run.
+ *   Orderbook: same lag skips appendMarketReportRow only so CSV rows stay aligned;
+ *   fair value is still published for trading.
  */
 
 import dotenv from 'dotenv';
@@ -28,6 +29,7 @@ import {
   BTC_STALE_FORBID_MS,
   MIN_CONFIDENCE,
   STOP_TRADING_BEFORE_EXPIRY_MS,
+  VERBOSE,
   VOLATILITY_EWMA_LAMBDA,
   VOLATILITY_MIN_TICKS,
 } from '../config/constants.js';
@@ -52,6 +54,9 @@ import {
 } from '../shared/types.js';
 
 dotenv.config();
+
+/** Distinguishes Chainlink vs orderbook triggers for oracle-lag handling. */
+type FairValueComputeTrigger = 'chainlink' | 'orderbook';
 
 // ─── Mutable market state (updated on each market rotation) ───────────────────
 
@@ -200,7 +205,7 @@ async function warmVolatilityEstimator(): Promise<void> {
 async function computeAndPublish(
   btcFeed: ChainlinkBtcPriceFeed,
   obFeed: MarketOrderbookFeed,
-  enforceChainlinkOracleLagForbid = false
+  trigger: FairValueComputeTrigger = 'orderbook'
 ): Promise<void> {
   if (!MARKET_ID) return;
 
@@ -216,8 +221,8 @@ async function computeAndPublish(
     return;
   }
 
-  // ── Oracle payload lag (Chainlink pub/sub path only) ───────────────────────
-  if (enforceChainlinkOracleLagForbid) {
+  // ── Oracle payload lag (Chainlink path: forbid run; orderbook: skip report below) ──
+  if (trigger === 'chainlink') {
     const oracleLagMs = now - btcFeed.chainlinkTs;
     if (oracleLagMs > BTC_CHAINLINK_ORACLE_LAG_FORBID_MS) {
       console.log(
@@ -315,29 +320,42 @@ async function computeAndPublish(
 
   const { yesBid, yesAsk } = sanitizeYesTopOfBook(obFeed.bestBid, obFeed.bestAsk);
   await setFairValue(fv);
-  const binanceFeed = await getBtcPrice();
-  await appendMarketReportRow({
-    marketId: MARKET_ID,
-    fairValue: value,
-    confidence,
-    sigma: sigmaPerSecond,
-    sigma1m,
-    sigma5m,
-    btcPrice: btcFeed.price,
-    chainlinkTs: btcFeed.chainlinkTs,
-    binanceBtcPrice: binanceFeed !== null ? binanceFeed.price : null,
-    binanceTs: binanceFeed !== null ? binanceFeed.ts : null,
-    strikePrice: STRIKE_PRICE,
-    timeToExpiryMs,
-    yesBid,
-    yesAsk,
-    noBid: clampOutcomePrice(1 - yesAsk),
-    noAsk: clampOutcomePrice(1 - yesBid),
-    publishedAt: now,
-    ts: now,
-    fairValueSigma1m,
-    fairValueSigma5m,
-  });
+
+  const reportOracleLagMs = Date.now() - btcFeed.chainlinkTs;
+  const skipMarketReportForOracleLag =
+    trigger === 'orderbook' && reportOracleLagMs > BTC_CHAINLINK_ORACLE_LAG_FORBID_MS;
+
+  if (!skipMarketReportForOracleLag) {
+    const binanceFeed = await getBtcPrice();
+    await appendMarketReportRow({
+      marketId: MARKET_ID,
+      fairValue: value,
+      confidence,
+      sigma: sigmaPerSecond,
+      sigma1m,
+      sigma5m,
+      btcPrice: btcFeed.price,
+      chainlinkTs: btcFeed.chainlinkTs,
+      binanceBtcPrice: binanceFeed !== null ? binanceFeed.price : null,
+      binanceTs: binanceFeed !== null ? binanceFeed.ts : null,
+      strikePrice: STRIKE_PRICE,
+      timeToExpiryMs,
+      yesBid,
+      yesAsk,
+      noBid: clampOutcomePrice(1 - yesAsk),
+      noAsk: clampOutcomePrice(1 - yesBid),
+      publishedAt: now,
+      ts: now,
+      fairValueSigma1m,
+      fairValueSigma5m,
+    });
+  } else if (VERBOSE) {
+    console.log(
+      `[fairValueUpdater] skip appendMarketReportRow (orderbook): oracle lag ${reportOracleLagMs}ms > ` +
+      `${BTC_CHAINLINK_ORACLE_LAG_FORBID_MS}ms`
+    );
+  }
+
   lastReportYesBid = yesBid;
   lastReportYesAsk = yesAsk;
 
@@ -443,12 +461,12 @@ async function start(): Promise<void> {
             }
             const obFeed = await getOrderbook(MARKET_ID);
             if (!obFeed) return;
-            await computeAndPublish(btcFeed, obFeed, true);
+            await computeAndPublish(btcFeed, obFeed, 'chainlink');
           } else if (channel === REDIS_CHANNELS.orderbookUpdated(MARKET_ID)) {
             const obFeed = JSON.parse(message) as MarketOrderbookFeed;
             const btcFeed = await getChainlinkBtcPrice();
             if (!btcFeed) return;
-            await computeAndPublish(btcFeed, obFeed);
+            await computeAndPublish(btcFeed, obFeed, 'orderbook');
           }
         } finally {
           isProcessing = false;
