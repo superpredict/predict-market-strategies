@@ -19,7 +19,7 @@
 import dotenv from 'dotenv';
 import { MARKET_DISCOVERY_POLL_MS } from '../config/constants.js';
 import { closeRedis, getRedisClient } from '../shared/redis.js';
-import { getActiveMarket, setActiveMarket } from '../shared/state.js';
+import { getActiveMarket, getChainlinkStrikeForWindow, setActiveMarket } from '../shared/state.js';
 import { REDIS_CHANNELS, type ActiveMarketInfo } from '../shared/types.js';
 import { generateMarketRoundReport } from '../tools/marketRoundReport.js';
 
@@ -148,38 +148,43 @@ async function fetchMarketBySlug(slug: string): Promise<GammaMarketResponse | nu
 }
 
 async function fetchStrikePrice(windowTs: number): Promise<number | null> {
-  const res = await fetch(VATIC_TARGETS_URL);
-  if (!res.ok) {
-    throw new Error(`Vatic targets API ${res.status}: ${res.statusText} for ${VATIC_TARGETS_URL}`);
-  }
+  try {
+    const res = await fetch(VATIC_TARGETS_URL);
+    if (!res.ok) {
+      throw new Error(`Vatic targets API ${res.status}: ${res.statusText} for ${VATIC_TARGETS_URL}`);
+    }
 
-  const body = (await res.json()) as VaticTargetsResponse;
-  const target = body.results.find(
-    (item) => item.marketType === '15min' && item.windowStart === windowTs
-  );
-
-  if (!target) {
-    const windows = body.results.map((item) => item.windowStartIso).join(', ') || 'none';
-    console.warn(
-      `[marketDiscovery] Vatic targets API returned no 15min target for windowTs=${windowTs} ` +
-      `(available windows: ${windows})`
+    const body = (await res.json()) as VaticTargetsResponse;
+    const target = body.results.find(
+      (item) => item.marketType === '15min' && item.windowStart === windowTs
     );
+
+    if (!target) {
+      const windows = body.results.map((item) => item.windowStartIso).join(', ') || 'none';
+      console.warn(
+        `[marketDiscovery] Vatic targets API returned no 15min target for windowTs=${windowTs} ` +
+        `(available windows: ${windows})`
+      );
+      return null;
+    }
+
+    if (!target.ok || !Number.isFinite(target.price) || target.price <= 0) {
+      console.warn(
+        `[marketDiscovery] Vatic target invalid for windowTs=${windowTs}: ` +
+        `ok=${target.ok} price=${target.price}`
+      );
+      return null;
+    }
+
+    console.log(
+      `[marketDiscovery] Vatic strike target $${target.price.toFixed(2)} ` +
+      `(source=${target.source}, windowStart=${target.windowStartIso})`
+    );
+    return target.price;
+  } catch (err) {
+    console.error('[marketDiscovery] Vatic targets API error');
     return null;
   }
-
-  if (!target.ok || !Number.isFinite(target.price) || target.price <= 0) {
-    console.warn(
-      `[marketDiscovery] Vatic target invalid for windowTs=${windowTs}: ` +
-      `ok=${target.ok} price=${target.price}`
-    );
-    return null;
-  }
-
-  console.log(
-    `[marketDiscovery] Vatic strike target $${target.price.toFixed(2)} ` +
-    `(source=${target.source}, windowStart=${target.windowStartIso})`
-  );
-  return target.price;
 }
 
 // ─── Core discovery logic ─────────────────────────────────────────────────────
@@ -227,8 +232,27 @@ async function checkAndPublish(): Promise<void> {
     return;
   }
 
-  // ── Strike price: Vatic active target for the detected 15-min window ──────
-  const strikePrice = await fetchStrikePrice(windowTs);
+  // ── Strike price: Vatic active target, fallback to Chainlink boundary price ─
+  let strikeSource: 'vatic' | 'chainlink' | 'none' = 'none';
+  let strikePrice = await fetchStrikePrice(windowTs);
+  if (strikePrice !== null) {
+    strikeSource = 'vatic';
+  } else {
+    strikePrice = await getChainlinkStrikeForWindow(windowTs);
+    if (strikePrice !== null) {
+      strikeSource = 'chainlink';
+      console.log(
+        `[marketDiscovery] fallback strike target $${strikePrice.toFixed(2)} ` +
+        `(source=chainlink, windowStart=${windowTs})`
+      );
+    } else {
+      console.warn(
+        `[marketDiscovery] strike unavailable for windowTs=${windowTs} ` +
+        '(vatic unavailable and chainlink fallback missing exact boundary entry)'
+      );
+    }
+  }
+
   let deribitInstrumentName: string | null = null;
   let deribitMarkIvAnnual: number | null = null;
   try {
@@ -281,9 +305,7 @@ async function checkAndPublish(): Promise<void> {
   lastPublishedWindowTs = windowTs;
 
   const strikeLine =
-    info.strikePrice !== null
-      ? `$${info.strikePrice.toLocaleString()} (vatic active target)`
-      : 'N/A — Vatic target unavailable';
+    info.strikePrice !== null ? `$${info.strikePrice.toLocaleString()} (${strikeSource})` : 'N/A';
   const deribitLine =
     info.deribitMarkIvAnnual !== null
       ? `${(info.deribitMarkIvAnnual * 100).toFixed(2)}% (${info.deribitInstrumentName})`
