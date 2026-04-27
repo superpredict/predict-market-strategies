@@ -1,14 +1,15 @@
 /**
- * Backtest variant **(b)** rules on existing market round report CSVs using
- * `f_deribit_iv` / `g_deribit_iv` / `f_minus_g_deribit_iv`.
- * Long and short YES: **1 share** per signal, cumulative position capped at **±20** (default).
- * Long and short use the **same** filters (confidence, TTE, YES spread, sigma regime).
- * Writes a markdown summary under takerbot/reports/.
+ * Backtest report signals on existing market round report CSVs.
  *
- * Usage (from repo root):
- *   npm run takerbot:reportBacktest
- *   node --import tsx/esm takerbot/tools/backtestReportSignals.ts --delta 0.05 --gamma 0.03 --max-yes-shares 20
- * Optional: --min-confidence, --min-tte-ms, --max-yes-spread, --sigma-window, --sigma-min-ratio, --sigma-max-ratio
+ * Runs three variants in one execution and writes one combined markdown report:
+ * - (a): sigma_5m track
+ * - (b): sigma_10m track
+ * - (c): deribit_iv track
+ *
+ * The output includes per-variant summaries and side-by-side comparison.
+ *
+ * Long and short YES: 1 share per signal; cumulative position capped at ±20 by default.
+ * Long and short use the same execution filters (trade signal + TTE + spread + sigma regime).
  */
 
 import { readdir, readFile, writeFile } from 'node:fs/promises';
@@ -51,6 +52,44 @@ interface CliArgs {
   sigmaMinRatio: number;
   sigmaMaxRatio: number;
 }
+
+type VariantKey = 'a' | 'b' | 'c';
+
+interface VariantConfig {
+  key: VariantKey;
+  title: string;
+  signalColumn: string;
+  fColumn: string;
+  gColumn: string;
+  fMinusGColumn: string;
+}
+
+const VARIANT_CONFIGS: VariantConfig[] = [
+  {
+    key: 'a',
+    title: 'sigma_5m',
+    signalColumn: 'trade_signal_sigma_5m',
+    fColumn: 'f_sigma_5m',
+    gColumn: 'g_sigma_5m',
+    fMinusGColumn: 'f_minus_g_sigma_5m',
+  },
+  {
+    key: 'b',
+    title: 'sigma_10m',
+    signalColumn: 'trade_signal_sigma_10m',
+    fColumn: 'f_sigma_10m',
+    gColumn: 'g_sigma_10m',
+    fMinusGColumn: 'f_minus_g_sigma_10m',
+  },
+  {
+    key: 'c',
+    title: 'deribit_iv',
+    signalColumn: 'trade_signal_deribit_iv',
+    fColumn: 'f_deribit_iv',
+    gColumn: 'g_deribit_iv',
+    fMinusGColumn: 'f_minus_g_deribit_iv',
+  },
+];
 
 function parseArgs(argv: string[]): CliArgs {
   let delta = DEFAULT_DELTA;
@@ -127,18 +166,25 @@ function parseArgs(argv: string[]): CliArgs {
 interface CsvRow {
   isoTime: string;
   ts: number;
-  fairValue: number;
   chainlinkPrice: number;
   btcPrice: number | null;
   strikePrice: number | null;
   yesBid: number;
   yesAsk: number;
-  f: number;
-  g: number | null;
-  fMinusG: number | null;
-  confidence: number | null;
+  fSigma5m: number | null;
+  gSigma5m: number | null;
+  fMinusGSigma5m: number | null;
+  fSigma10m: number | null;
+  gSigma10m: number | null;
+  fMinusGSigma10m: number | null;
+  fDeribitIv: number | null;
+  gDeribitIv: number | null;
+  fMinusGDeribitIv: number | null;
   timeToExpiryMs: number | null;
-  annualizedSigma: number | null;
+  annualizedSigma5m: number | null;
+  tradeSignalSigma5m: -1 | 0 | 1 | null;
+  tradeSignalSigma10m: -1 | 0 | 1 | null;
+  tradeSignalDeribitIv: -1 | 0 | 1 | null;
 }
 
 function parseNum(s: string): number | null {
@@ -157,25 +203,28 @@ function parseCsv(content: string): CsvRow[] {
     if (i < 0) throw new Error(`CSV missing column ${name}`);
     return i;
   };
-  const idxOpt = (name: string) => {
-    const i = header.indexOf(name);
-    return i < 0 ? null : i;
-  };
   const I = {
     iso: idx('iso_time'),
-    ts: idx('ts'),
-    fv: idx('fair_value'),
+    ts: idx('fair_value_redis_ts'),
     cl: idx('chainlink_price'),
-    btc: idxOpt('binance_btcusdc_price'),
+    btc: idx('binance_btcusdc_price'),
     strike: idx('strike_price'),
     bid: idx('yes_bid'),
     ask: idx('yes_ask'),
-    f: idx('f_deribit_iv'),
-    g: idx('g_deribit_iv'),
-    fg: idx('f_minus_g_deribit_iv'),
-    conf: idxOpt('confidence'),
-    tte: idxOpt('time_to_expiry_ms'),
-    sig: idxOpt('annualized_sigma_5m'),
+    f5: idx('f_sigma_5m'),
+    g5: idx('g_sigma_5m'),
+    fg5: idx('f_minus_g_sigma_5m'),
+    f10: idx('f_sigma_10m'),
+    g10: idx('g_sigma_10m'),
+    fg10: idx('f_minus_g_sigma_10m'),
+    fDeribit: idx('f_deribit_iv'),
+    gDeribit: idx('g_deribit_iv'),
+    fgDeribit: idx('f_minus_g_deribit_iv'),
+    signal5: idx('trade_signal_sigma_5m'),
+    signal10: idx('trade_signal_sigma_10m'),
+    signal: idx('trade_signal_deribit_iv'),
+    tte: idx('time_to_expiry_ms'),
+    sig5: idx('annualized_sigma_5m'),
   };
 
   const rows: CsvRow[] = [];
@@ -183,27 +232,43 @@ function parseCsv(content: string): CsvRow[] {
     const cols = lines[li]!.split(',');
     if (cols.length < header.length) continue;
     const strike = parseNum(cols[I.strike]!);
-    const g = parseNum(cols[I.g]!);
-    const fg = parseNum(cols[I.fg]!);
-    const conf = I.conf !== null ? parseNum(cols[I.conf]!) : null;
-    const tte = I.tte !== null ? parseNum(cols[I.tte]!) : null;
-    const sig = I.sig !== null ? parseNum(cols[I.sig]!) : null;
-    const btcParsed = I.btc !== null ? parseNum(cols[I.btc]!) : null;
+    const g5 = parseNum(cols[I.g5]!);
+    const fg5 = parseNum(cols[I.fg5]!);
+    const g10 = parseNum(cols[I.g10]!);
+    const fg10 = parseNum(cols[I.fg10]!);
+    const gDeribit = parseNum(cols[I.gDeribit]!);
+    const fgDeribit = parseNum(cols[I.fgDeribit]!);
+    const tte = parseNum(cols[I.tte]!);
+    const sig5 = parseNum(cols[I.sig5]!);
+    const btcParsed = parseNum(cols[I.btc]!);
+    const signal5 = parseNum(cols[I.signal5]!);
+    const signal10 = parseNum(cols[I.signal10]!);
+    const signal = parseNum(cols[I.signal]!);
     rows.push({
       isoTime: cols[I.iso]!,
       ts: Number(cols[I.ts]),
-      fairValue: Number(cols[I.fv]),
       chainlinkPrice: Number(cols[I.cl]),
       btcPrice: btcParsed,
       strikePrice: strike,
       yesBid: Number(cols[I.bid]),
       yesAsk: Number(cols[I.ask]),
-      f: Number(cols[I.f]),
-      g,
-      fMinusG: fg,
-      confidence: conf,
+      fSigma5m: parseNum(cols[I.f5]!),
+      gSigma5m: g5,
+      fMinusGSigma5m: fg5,
+      fSigma10m: parseNum(cols[I.f10]!),
+      gSigma10m: g10,
+      fMinusGSigma10m: fg10,
+      fDeribitIv: parseNum(cols[I.fDeribit]!),
+      gDeribitIv: gDeribit,
+      fMinusGDeribitIv: fgDeribit,
       timeToExpiryMs: tte,
-      annualizedSigma: sig,
+      annualizedSigma5m: sig5,
+      tradeSignalSigma5m:
+        signal5 === 1 || signal5 === 0 || signal5 === -1 ? signal5 : null,
+      tradeSignalSigma10m:
+        signal10 === 1 || signal10 === 0 || signal10 === -1 ? signal10 : null,
+      tradeSignalDeribitIv:
+        signal === 1 || signal === 0 || signal === -1 ? signal : null,
     });
   }
   rows.sort((a, b) => a.ts - b.ts);
@@ -222,7 +287,6 @@ interface BuyFill {
   f: number;
   g: number;
   fMinusG: number;
-  confidence: number;
 }
 
 interface BuyScaledResult {
@@ -244,7 +308,6 @@ interface ShortFill {
   f: number;
   g: number;
   fMinusG: number;
-  confidence: number;
 }
 
 interface ShortScaledResult {
@@ -268,6 +331,38 @@ interface BacktestFileOutcome {
   skipReason: string | null;
 }
 
+interface SelectedSignalFields {
+  signal: -1 | 0 | 1 | null;
+  f: number | null;
+  g: number | null;
+  fMinusG: number | null;
+}
+
+function pickSignalFields(row: CsvRow, variant: VariantKey): SelectedSignalFields {
+  if (variant === 'a') {
+    return {
+      signal: row.tradeSignalSigma5m,
+      f: row.fSigma5m,
+      g: row.gSigma5m,
+      fMinusG: row.fMinusGSigma5m,
+    };
+  }
+  if (variant === 'b') {
+    return {
+      signal: row.tradeSignalSigma10m,
+      f: row.fSigma10m,
+      g: row.gSigma10m,
+      fMinusG: row.fMinusGSigma10m,
+    };
+  }
+  return {
+    signal: row.tradeSignalDeribitIv,
+    f: row.fDeribitIv,
+    g: row.gDeribitIv,
+    fMinusG: row.fMinusGDeribitIv,
+  };
+}
+
 function sigmaRegimeOk(
   rows: CsvRow[],
   i: number,
@@ -276,12 +371,12 @@ function sigmaRegimeOk(
   maxRatio: number,
 ): boolean {
   const row = rows[i];
-  const cur = row?.annualizedSigma;
+  const cur = row?.annualizedSigma5m;
   if (cur === null || cur === undefined || !Number.isFinite(cur) || cur <= 0) return false;
   const lo = Math.max(0, i - window + 1);
   const hist: number[] = [];
   for (let j = lo; j <= i; j++) {
-    const s = rows[j]?.annualizedSigma;
+    const s = rows[j]?.annualizedSigma5m;
     if (s !== null && s !== undefined && Number.isFinite(s) && s > 0) hist.push(s);
   }
   const minSamples = Math.min(5, Math.max(3, Math.floor(window / 6)));
@@ -307,6 +402,7 @@ function runBacktestOnRows(
     | 'sigmaMinRatio'
     | 'sigmaMaxRatio'
   >,
+  variant: VariantKey,
 ): BacktestFileOutcome {
   if (rows.length === 0) {
     return {
@@ -347,11 +443,11 @@ function runBacktestOnRows(
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
     if (r === undefined) continue;
-    if (r.g === null || r.fMinusG === null) continue;
+    const fields = pickSignalFields(r, variant);
+    if (fields.g === null || fields.fMinusG === null || fields.f === null) continue;
 
     const buySignal =
-      r.f >= args.delta &&
-      r.fMinusG >= args.gamma &&
+      fields.signal === 1 &&
       r.yesAsk > 0 &&
       Number.isFinite(r.yesAsk);
 
@@ -363,7 +459,8 @@ function runBacktestOnRows(
       spread >= 0 &&
       spread <= args.maxYesSpread;
 
-    const confOk = r.confidence !== null && Number.isFinite(r.confidence) && r.confidence >= args.minConfidence;
+    // trade_signal_deribit_iv already includes confidence filtering in round report generation.
+    const confOk = true;
 
     const tteOk =
       r.timeToExpiryMs !== null &&
@@ -387,17 +484,15 @@ function runBacktestOnRows(
         entryIso: r.isoTime,
         qty,
         entryYesAsk: r.yesAsk,
-        f: r.f,
-        g: r.g,
-        fMinusG: r.fMinusG,
-        confidence: r.confidence!,
+        f: fields.f,
+        g: fields.g,
+        fMinusG: fields.fMinusG,
       });
       positionYes += qty;
     }
 
     const sellOk =
-      r.f <= -args.delta &&
-      r.fMinusG <= -args.gamma &&
+      fields.signal === -1 &&
       r.yesBid > 0 &&
       Number.isFinite(r.yesBid);
 
@@ -407,10 +502,9 @@ function runBacktestOnRows(
         entryRowIndex: i,
         entryIso: r.isoTime,
         entryYesBid: r.yesBid,
-        f: r.f,
-        g: r.g,
-        fMinusG: r.fMinusG,
-        confidence: r.confidence!,
+        f: fields.f,
+        g: fields.g,
+        fMinusG: fields.fMinusG,
       });
       positionShort += 1;
     }
@@ -477,194 +571,173 @@ interface MarketRow {
   skipReason: string | null;
 }
 
-function buildMarkdown(args: CliArgs, results: MarketRow[], outputName: string): string {
+interface VariantSummary {
+  longMarkets: number;
+  shortMarkets: number;
+  longTotalPnl: number;
+  shortTotalPnl: number;
+  combinedPnl: number;
+  longWinRate: number;
+  shortWinRate: number;
+  longAdds: number;
+  shortAdds: number;
+}
+
+interface VariantRunResult {
+  config: VariantConfig;
+  results: MarketRow[];
+  summary: VariantSummary;
+}
+
+function summarizeVariant(results: MarketRow[]): VariantSummary {
+  const longRows = results.filter((r) => r.buyScaled !== null);
+  const shortRows = results.filter((r) => r.shortScaled !== null);
+  const longTotalPnl = longRows.reduce((sum, r) => sum + (r.buyScaled?.pnl ?? 0), 0);
+  const shortTotalPnl = shortRows.reduce((sum, r) => sum + (r.shortScaled?.pnl ?? 0), 0);
+  const longWins = longRows.filter((r) => (r.buyScaled?.pnl ?? 0) > 0).length;
+  const shortWins = shortRows.filter((r) => (r.shortScaled?.pnl ?? 0) > 0).length;
+  const longAdds = longRows.reduce((sum, r) => sum + (r.buyScaled?.fills.length ?? 0), 0);
+  const shortAdds = shortRows.reduce((sum, r) => sum + (r.shortScaled?.fills.length ?? 0), 0);
+
+  return {
+    longMarkets: longRows.length,
+    shortMarkets: shortRows.length,
+    longTotalPnl,
+    shortTotalPnl,
+    combinedPnl: longTotalPnl + shortTotalPnl,
+    longWinRate: longRows.length > 0 ? longWins / longRows.length : 0,
+    shortWinRate: shortRows.length > 0 ? shortWins / shortRows.length : 0,
+    longAdds,
+    shortAdds,
+  };
+}
+
+function formatPct(value: number): string {
+  return `${(value * 100).toFixed(2)}%`;
+}
+
+function appendVariantSection(lines: string[], run: VariantRunResult): void {
+  const { config, results, summary } = run;
+  lines.push(`## Variant (${config.key}) — ${config.title}`);
+  lines.push('');
+  lines.push(`- signal column: \`${config.signalColumn}\``);
+  lines.push(`- f/g/f-g: \`${config.fColumn}\` / \`${config.gColumn}\` / \`${config.fMinusGColumn}\``);
+  lines.push(`- long markets with fills: **${summary.longMarkets}**`);
+  lines.push(`- short markets with fills: **${summary.shortMarkets}**`);
+  lines.push(`- long total PnL: **${formatMoney(summary.longTotalPnl)}**`);
+  lines.push(`- short total PnL: **${formatMoney(summary.shortTotalPnl)}**`);
+  lines.push(`- combined PnL: **${formatMoney(summary.combinedPnl)}**`);
+  lines.push(`- long win rate: **${formatPct(summary.longWinRate)}**`);
+  lines.push(`- short win rate: **${formatPct(summary.shortWinRate)}**`);
+  lines.push(`- total long adds: **${summary.longAdds}**`);
+  lines.push(`- total short adds: **${summary.shortAdds}**`);
+  lines.push('');
+  lines.push('| source CSV | YES payoff | long PnL | #L | short PnL | #S | combined PnL |');
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const m of results) {
+    if (m.skipReason !== null) {
+      lines.push(`\`${m.source}\` | — | — | — | — | — | skipped (${m.skipReason})`);
+      continue;
+    }
+    const longPnl = m.buyScaled?.pnl ?? 0;
+    const shortPnl = m.shortScaled?.pnl ?? 0;
+    const combined = longPnl + shortPnl;
+    lines.push(
+      [
+        `\`${m.source}\``,
+        String(m.yesPayoff ?? '—'),
+        m.buyScaled ? formatMoney(longPnl) : '—',
+        m.buyScaled ? String(m.buyScaled.fills.length) : '0',
+        m.shortScaled ? formatMoney(shortPnl) : '—',
+        m.shortScaled ? String(m.shortScaled.fills.length) : '0',
+        formatMoney(combined),
+      ].join(' | '),
+    );
+  }
+  lines.push('');
+}
+
+function buildCombinedMarkdown(args: CliArgs, runs: VariantRunResult[], outputName: string): string {
   const lines: string[] = [];
-  lines.push(`# Report backtest (variant **(b)**): f_deribit_iv / g_deribit_iv / f_minus_g_deribit_iv`);
+  lines.push('# Report backtest compare: variants (a)/(b)/(c)');
   lines.push('');
   lines.push(`- generated: ${new Date().toISOString()}`);
   lines.push(`- output: \`takerbot/reports/${outputName}\``);
   lines.push(`- source reports: all \`*.csv\` in reports dir (excluding names starting with \`backtest-\`)`);
   lines.push('');
 
-  lines.push('## Assumptions (read carefully)');
-  lines.push('');
-  lines.push(
-    '1. **Variant (b)** — Signals use CSV columns `f_deribit_iv`, `g_deribit_iv`, and `f_minus_g_deribit_iv` (Deribit mark-IV fair value minus YES ask), matching the round report definition.',
-  );
-  lines.push(
-    '2. **`g` in CSV** — Produced by the round report as the mean of the **previous** 10 `f` samples (`g(t) = average(f(t−1)…f(t−10))`); a row is eligible only when `g` and `f_minus_g` are non-blank.',
-  );
-  lines.push(
-    '3. **Long YES** — Each qualifying row adds **exactly 1** share; cumulative long size is capped at `--max-yes-shares` (max **20**).',
-  );
-  lines.push(
-    '4. **Short YES** — Each qualifying row adds **exactly 1** short share; cumulative short size uses the **same** cap (independent long/short books, not netted).',
-  );
-  lines.push('5. **Hold to settlement** — No interim exit; long PnL is `yesPayoff × totalShares − sum(yes_ask)`; short PnL is `sum(yes_bid) − yesPayoff × totalShares`.');
-  lines.push(
-    '6. **YES payoff** — `yesPayoff = 1` if settlement spot **strictly exceeds** strike `K`, else `0` (same strike rule as before).',
-  );
-  lines.push(
-    '7. **Settlement price proxy** — `btc_price` on the **last** CSV row when present (Binance mid in new reports); otherwise `chainlink_price`.',
-  );
-  lines.push('8. **Strike** — From `strike_price` (first positive); else file skipped.');
-  lines.push(
-    '9. **Shared filters (long and short)** — In addition to the respective `f` / `f−g` sign rules: `confidence ≥ minConfidence`; `time_to_expiry_ms > minTte`; YES spread `yes_ask − yes_bid ≤ maxYesSpread`; `annualized_sigma` within `[median×minRatio, median×maxRatio]` over a trailing window.',
-  );
-  lines.push('10. **Fees, funding, borrow, latency** — Ignored. Slippage beyond bid/ask columns ignored.');
-  lines.push('11. **Overlapping long and short** — Backtested **independently** (not netted).');
-  lines.push(
-    '12. **Optional CSV columns** — If `confidence`, `time_to_expiry_ms`, or `annualized_sigma` are missing from the header, **both** long and short adds are effectively disabled (filters never pass).',
-  );
-  lines.push('');
-
-  lines.push('## Rule definitions');
-  lines.push('');
-  lines.push(
-    '- **Buy YES (+1 sh)** when: `g` defined, `f ≥ δ`, `f − g ≥ γ`, plus the shared filters in assumption 9.',
-  );
-  lines.push(
-    '- **Sell YES (+1 short sh)** when: `g` defined, `f ≤ −δ`, `f − g ≤ −γ`, plus the **same** shared filters in assumption 9, and room under the position cap.',
-  );
-  lines.push('');
-
   lines.push('## Parameters used in this run');
   lines.push('');
   lines.push(`- \`δ\` (delta): **${args.delta}**`);
   lines.push(`- \`γ\` (gamma): **${args.gamma}**`);
-  lines.push(`- min confidence: **${args.minConfidence}**`);
-  lines.push(`- min time-to-expiry (ms): **${args.minTimeToExpiryMs}** (must be **strictly greater** than this)`);
+  lines.push(`- min confidence: **${args.minConfidence}** (currently informational; signal already pre-filtered in report)`);
+  lines.push(`- min time-to-expiry (ms): **${args.minTimeToExpiryMs}** (must be strictly greater than this)`);
   lines.push(`- max YES spread (ask−bid): **${args.maxYesSpread}**`);
-  lines.push(`- max cumulative shares per side (long cap / short cap): **${args.maxYesShares}** (fixed band ±20 when using defaults)`);
+  lines.push(`- max cumulative shares per side (long cap / short cap): **${args.maxYesShares}**`);
   lines.push(`- sigma median window: **${args.sigmaMedianWindow}**, ratio band: **[${args.sigmaMinRatio}, ${args.sigmaMaxRatio}]× median**`);
   lines.push(`- reports directory: \`${args.reportsDir}\``);
   lines.push('');
 
-  lines.push('## Per-market results');
+  lines.push('## Variant Comparison');
   lines.push('');
-  lines.push(
-    '| source CSV | strike | settlement | YES payoff | long sh | long cost | long PnL | #L | short sh | short PnL | #S | first long | first short |',
-  );
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |');
-
-  let sumBuy = 0;
-  let nBuyMkts = 0;
-  let sumShort = 0;
-  let nShortMkts = 0;
-
-  for (const m of results) {
-    const bs = m.buyScaled;
-    const ss = m.shortScaled;
-    if (bs) {
-      sumBuy += bs.pnl;
-      nBuyMkts += 1;
-    }
-    if (ss) {
-      sumShort += ss.pnl;
-      nShortMkts += 1;
-    }
-    if (m.skipReason !== null) {
-      lines.push(
-        [
-          `\`${m.source}\` (${m.skipReason})`,
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-          '—',
-        ].join(' | '),
-      );
-      continue;
-    }
-    const strike = m.strike!;
-    const setPx = m.settlementPrice!;
-    const yp = m.yesPayoff!;
-    const firstLong = bs && bs.fills[0] ? bs.fills[0].entryIso : '—';
-    const firstShort = ss && ss.fills[0] ? ss.fills[0].entryIso : '—';
+  lines.push('| variant | signal column | long PnL | short PnL | combined PnL | long win rate | short win rate | #L adds | #S adds |');
+  lines.push('| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  for (const run of runs) {
     lines.push(
       [
-        `\`${m.source}\``,
-        strike.toFixed(2),
-        setPx.toFixed(2),
-        String(yp),
-        bs ? String(bs.totalShares) : '0',
-        bs ? formatMoney(bs.totalCost) : '—',
-        bs ? formatMoney(bs.pnl) : '—',
-        bs ? String(bs.fills.length) : '0',
-        ss ? String(ss.totalShares) : '0',
-        ss ? formatMoney(ss.pnl) : '—',
-        ss ? String(ss.fills.length) : '0',
-        firstLong,
-        firstShort,
+        `(${run.config.key}) ${run.config.title}`,
+        `\`${run.config.signalColumn}\``,
+        formatMoney(run.summary.longTotalPnl),
+        formatMoney(run.summary.shortTotalPnl),
+        formatMoney(run.summary.combinedPnl),
+        formatPct(run.summary.longWinRate),
+        formatPct(run.summary.shortWinRate),
+        String(run.summary.longAdds),
+        String(run.summary.shortAdds),
       ].join(' | '),
     );
   }
-
-  lines.push('');
-  lines.push('## Aggregate (over markets with a fill)');
-  lines.push('');
-  lines.push(
-    `- long: **${nBuyMkts}** markets with ≥1 add, sum PnL: **${formatMoney(sumBuy)}**, avg/market: **${nBuyMkts ? formatMoney(sumBuy / nBuyMkts) : 'n/a'}**`,
-  );
-  lines.push(
-    `- short: **${nShortMkts}** markets with ≥1 short add, sum PnL: **${formatMoney(sumShort)}**, avg/market: **${nShortMkts ? formatMoney(sumShort / nShortMkts) : 'n/a'}**`,
-  );
   lines.push('');
 
-  lines.push('## Detail: long adds per file (+1 sh each)');
+  const ranked = [...runs].sort((a, b) => b.summary.combinedPnl - a.summary.combinedPnl);
+  lines.push('Ranking by combined PnL:');
+  ranked.forEach((run, idx) => {
+    lines.push(`${idx + 1}. (${run.config.key}) ${run.config.title}: **${formatMoney(run.summary.combinedPnl)}**`);
+  });
   lines.push('');
-  for (const m of results) {
-    const bs = m.buyScaled;
-    if (m.skipReason !== null) {
-      lines.push(`- \`${m.source}\` / ${m.slug}: **skipped** (${m.skipReason})`);
-      continue;
-    }
-    if (!bs || bs.fills.length === 0) {
-      lines.push(`- \`${m.source}\` / ${m.slug}: **no long fills**`);
-      continue;
-    }
+
+  lines.push('## Per-Market Compare (combined PnL)');
+  lines.push('');
+  lines.push('| source CSV | payoff | (a) sigma_5m | (b) sigma_10m | (c) deribit_iv |');
+  lines.push('| --- | ---: | ---: | ---: | ---: |');
+  const aMap = new Map(runs.find((r) => r.config.key === 'a')?.results.map((r) => [r.source, r]) ?? []);
+  const bMap = new Map(runs.find((r) => r.config.key === 'b')?.results.map((r) => [r.source, r]) ?? []);
+  const cMap = new Map(runs.find((r) => r.config.key === 'c')?.results.map((r) => [r.source, r]) ?? []);
+  const allSources = new Set<string>([...Array.from(aMap.keys()), ...Array.from(bMap.keys()), ...Array.from(cMap.keys())]);
+  for (const source of Array.from(allSources).sort()) {
+    const a = aMap.get(source);
+    const b = bMap.get(source);
+    const c = cMap.get(source);
+    const payoff = a?.yesPayoff ?? b?.yesPayoff ?? c?.yesPayoff ?? null;
+    const combined = (m: MarketRow | undefined) => (m ? (m.buyScaled?.pnl ?? 0) + (m.shortScaled?.pnl ?? 0) : null);
+    const fa = combined(a);
+    const fb = combined(b);
+    const fc = combined(c);
     lines.push(
-      `- \`${m.source}\` / ${m.slug}: **${bs.fills.length}** add(s), **${bs.totalShares}** sh, cost **${formatMoney(bs.totalCost)}** → PnL **${formatMoney(bs.pnl)}** (payoff ${bs.yesPayoff} per sh)`,
+      [
+        `\`${source}\``,
+        payoff === null ? '—' : String(payoff),
+        fa === null ? '—' : formatMoney(fa),
+        fb === null ? '—' : formatMoney(fb),
+        fc === null ? '—' : formatMoney(fc),
+      ].join(' | '),
     );
-    for (const f of bs.fills) {
-      lines.push(
-        `  - \`${f.entryIso}\`  +${f.qty} @ **${f.entryYesAsk.toFixed(6)}**  conf=${f.confidence.toFixed(4)}  ` +
-          `f=${f.f.toFixed(6)} g=${f.g.toFixed(6)} f−g=${f.fMinusG.toFixed(6)}`,
-      );
-    }
   }
   lines.push('');
 
-  lines.push('## Detail: short adds per file (+1 sh each)');
-  lines.push('');
-  for (const m of results) {
-    const ss = m.shortScaled;
-    if (m.skipReason !== null) {
-      lines.push(`- \`${m.source}\` / ${m.slug}: **skipped** (${m.skipReason})`);
-      continue;
-    }
-    if (!ss || ss.fills.length === 0) {
-      lines.push(`- \`${m.source}\` / ${m.slug}: **no short fills**`);
-      continue;
-    }
-    lines.push(
-      `- \`${m.source}\` / ${m.slug}: **${ss.fills.length}** short add(s), credit **${formatMoney(ss.totalCredit)}** → PnL **${formatMoney(ss.pnl)}** (payoff ${ss.yesPayoff} per sh)`,
-    );
-    for (const f of ss.fills) {
-      lines.push(
-        `  - \`${f.entryIso}\`  bid **${f.entryYesBid.toFixed(6)}**  conf=${f.confidence.toFixed(4)}  ` +
-          `f=${f.f.toFixed(6)} g=${f.g.toFixed(6)} f−g=${f.fMinusG.toFixed(6)}`,
-      );
-    }
+  for (const run of runs) {
+    appendVariantSection(lines, run);
   }
-  lines.push('');
 
   return lines.join('\n');
 }
@@ -677,30 +750,41 @@ async function main(): Promise<void> {
   );
   csvNames.sort();
 
-  const bundle: MarketRow[] = [];
-
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const parsedByName = new Map<string, CsvRow[]>();
   for (const name of csvNames) {
     const path = resolve(args.reportsDir, name);
     const raw = await readFile(path, 'utf8');
-    const rows = parseCsv(raw);
-    const slug = name.replace(/\.csv$/i, '');
-    const out = runBacktestOnRows(slug, name, rows, args);
-    bundle.push({
-      slug,
-      source: name,
-      strike: out.strike,
-      settlementPrice: out.settlementPrice,
-      yesPayoff: out.yesPayoff,
-      buyScaled: out.buyScaled,
-      shortScaled: out.shortScaled,
-      skipReason: out.skipReason,
-    });
+    parsedByName.set(name, parseCsv(raw));
   }
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const outName = `backtest-fg-a-${stamp}.md`;
+  const runs: VariantRunResult[] = [];
+  for (const variantConfig of VARIANT_CONFIGS) {
+    const bundle: MarketRow[] = [];
+    for (const name of csvNames) {
+      const rows = parsedByName.get(name) ?? [];
+      const slug = name.replace(/\.csv$/i, '');
+      const out = runBacktestOnRows(slug, name, rows, args, variantConfig.key);
+      bundle.push({
+        slug,
+        source: name,
+        strike: out.strike,
+        settlementPrice: out.settlementPrice,
+        yesPayoff: out.yesPayoff,
+        buyScaled: out.buyScaled,
+        shortScaled: out.shortScaled,
+        skipReason: out.skipReason,
+      });
+    }
+    runs.push({
+      config: variantConfig,
+      results: bundle,
+      summary: summarizeVariant(bundle),
+    });
+  }
+  const outName = `backtest-fg-compare-${stamp}.md`;
   const outPath = resolve(args.reportsDir, outName);
-  const md = buildMarkdown(args, bundle, outName);
+  const md = buildCombinedMarkdown(args, runs, outName);
   await writeFile(outPath, `${md}\n`, 'utf8');
   console.log(`Wrote ${outPath}`);
 }
