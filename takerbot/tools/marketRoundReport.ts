@@ -160,6 +160,14 @@ function sigmaRegimeOk(
   return current >= med * SIGNAL_SIGMA_MIN_RATIO && current <= med * SIGNAL_SIGMA_MAX_RATIO;
 }
 
+function deribitRegimeOk(deribitAnnualVolatility: number | null): boolean {
+  return (
+    deribitAnnualVolatility !== null &&
+    Number.isFinite(deribitAnnualVolatility) &&
+    deribitAnnualVolatility > 0
+  );
+}
+
 function computeTradeSignal(
   row: ComputedReportRow,
   f: number | null,
@@ -297,6 +305,7 @@ function computeRows(
     if (!row) continue;
     const sigma5mPass = sigmaRegimeOk(computed, i, 'annualizedSigma5m');
     const sigma10mPass = sigmaRegimeOk(computed, i, 'annualizedSigma10m');
+    const deribitPass = deribitRegimeOk(deribitAnnualVolatility);
     row.tradeSignalSigma5m = computeTradeSignal(row, row.fSigma5m, row.fMinusGSigma5m, sigma5mPass);
     row.tradeSignalSigma10m = computeTradeSignal(
       row,
@@ -308,7 +317,7 @@ function computeRows(
       row,
       row.fDeribitIv,
       row.fMinusGDeribitIv,
-      sigma5mPass,
+      deribitPass,
     );
   }
 

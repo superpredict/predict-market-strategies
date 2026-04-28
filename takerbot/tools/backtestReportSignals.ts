@@ -182,6 +182,7 @@ interface CsvRow {
   fMinusGDeribitIv: number | null;
   timeToExpiryMs: number | null;
   annualizedSigma5m: number | null;
+  annualizedSigma10m: number | null;
   tradeSignalSigma5m: -1 | 0 | 1 | null;
   tradeSignalSigma10m: -1 | 0 | 1 | null;
   tradeSignalDeribitIv: -1 | 0 | 1 | null;
@@ -225,6 +226,7 @@ function parseCsv(content: string): CsvRow[] {
     signal: idx('trade_signal_deribit_iv'),
     tte: idx('time_to_expiry_ms'),
     sig5: idx('annualized_sigma_5m'),
+    sig10: idx('annualized_sigma_10m'),
   };
 
   const rows: CsvRow[] = [];
@@ -240,6 +242,7 @@ function parseCsv(content: string): CsvRow[] {
     const fgDeribit = parseNum(cols[I.fgDeribit]!);
     const tte = parseNum(cols[I.tte]!);
     const sig5 = parseNum(cols[I.sig5]!);
+    const sig10 = parseNum(cols[I.sig10]!);
     const btcParsed = parseNum(cols[I.btc]!);
     const signal5 = parseNum(cols[I.signal5]!);
     const signal10 = parseNum(cols[I.signal10]!);
@@ -263,6 +266,7 @@ function parseCsv(content: string): CsvRow[] {
       fMinusGDeribitIv: fgDeribit,
       timeToExpiryMs: tte,
       annualizedSigma5m: sig5,
+      annualizedSigma10m: sig10,
       tradeSignalSigma5m:
         signal5 === 1 || signal5 === 0 || signal5 === -1 ? signal5 : null,
       tradeSignalSigma10m:
@@ -366,17 +370,19 @@ function pickSignalFields(row: CsvRow, variant: VariantKey): SelectedSignalField
 function sigmaRegimeOk(
   rows: CsvRow[],
   i: number,
+  sigmaSelector: (row: CsvRow) => number | null,
   window: number,
   minRatio: number,
   maxRatio: number,
 ): boolean {
   const row = rows[i];
-  const cur = row?.annualizedSigma5m;
+  const cur = row ? sigmaSelector(row) : null;
   if (cur === null || cur === undefined || !Number.isFinite(cur) || cur <= 0) return false;
   const lo = Math.max(0, i - window + 1);
   const hist: number[] = [];
   for (let j = lo; j <= i; j++) {
-    const s = rows[j]?.annualizedSigma5m;
+    const target = rows[j];
+    const s = target ? sigmaSelector(target) : null;
     if (s !== null && s !== undefined && Number.isFinite(s) && s > 0) hist.push(s);
   }
   const minSamples = Math.min(5, Math.max(3, Math.floor(window / 6)));
@@ -384,6 +390,10 @@ function sigmaRegimeOk(
   const med = median(hist);
   if (!Number.isFinite(med) || med <= 0) return false;
   return cur >= med * minRatio && cur <= med * maxRatio;
+}
+
+function deribitRegimeOk(row: CsvRow): boolean {
+  return row.fDeribitIv !== null && row.fMinusGDeribitIv !== null;
 }
 
 function runBacktestOnRows(
@@ -467,13 +477,26 @@ function runBacktestOnRows(
       Number.isFinite(r.timeToExpiryMs) &&
       r.timeToExpiryMs > args.minTimeToExpiryMs;
 
-    const volOk = sigmaRegimeOk(
-      rows,
-      i,
-      args.sigmaMedianWindow,
-      args.sigmaMinRatio,
-      args.sigmaMaxRatio,
-    );
+    const volOk =
+      variant === 'a'
+        ? sigmaRegimeOk(
+            rows,
+            i,
+            (row) => row.annualizedSigma5m,
+            args.sigmaMedianWindow,
+            args.sigmaMinRatio,
+            args.sigmaMaxRatio,
+          )
+        : variant === 'b'
+          ? sigmaRegimeOk(
+              rows,
+              i,
+              (row) => row.annualizedSigma10m,
+              args.sigmaMedianWindow,
+              args.sigmaMinRatio,
+              args.sigmaMaxRatio,
+            )
+          : deribitRegimeOk(r);
 
     const room = args.maxYesShares - positionYes;
 
