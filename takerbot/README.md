@@ -119,6 +119,14 @@ confidence = max(MIN_CONFIDENCE, timeBonus)
 
 `fairValueUpdater` appends Redis-backed report rows; `marketRoundReport` converts rows into markdown + CSV under `takerbot/reports/`.
 
+### Direction-aware f/g pricing
+
+`f` and `g` series are computed from a direction-aware executable YES price:
+- buy-side context uses `yes_ask`
+- short/sell-side context uses `yes_bid`
+
+Direction is inferred per fair value point against the YES mid price (`(yes_bid + yes_ask) / 2`), so short-side `f` values no longer reuse ask pricing.
+
 ### CSV schema (current)
 
 ```text

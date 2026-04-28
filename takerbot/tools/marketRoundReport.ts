@@ -190,6 +190,17 @@ function computeTradeSignal(
   return 0;
 }
 
+function directionalYesExecutionPrice(
+  fairValue: number | null | undefined,
+  yesBid: number,
+  yesAsk: number,
+): number {
+  if (fairValue === null || fairValue === undefined || !Number.isFinite(fairValue)) return yesAsk;
+  // Use ask for buy-side valuation and bid for sell-side valuation, based on fair value vs mid.
+  const mid = (yesBid + yesAsk) / 2;
+  return fairValue >= mid ? yesAsk : yesBid;
+}
+
 function computeRows(
   rows: MarketReportPoint[],
   deribitAnnualVolatility: number | null,
@@ -204,12 +215,17 @@ function computeRows(
     deribitAnnualVolatility !== null ? perSecondVolatilityFromAnnual(deribitAnnualVolatility) : null;
 
   for (const row of rows) {
-    const yesTokenPrice = row.yesAsk;
+    const yesTokenPrice = directionalYesExecutionPrice(row.fairValue, row.yesBid, row.yesAsk);
     const f = row.fairValue - yesTokenPrice;
     const { g, fMinusG } = rollingGFromPriorF(pastPrimaryF, f);
+    const yesTokenPriceSigma5m = directionalYesExecutionPrice(
+      row.fairValueSigma5m,
+      row.yesBid,
+      row.yesAsk,
+    );
     const fSigma5m =
       row.fairValueSigma5m !== null && row.fairValueSigma5m !== undefined
-        ? row.fairValueSigma5m - yesTokenPrice
+        ? row.fairValueSigma5m - yesTokenPriceSigma5m
         : null;
     const { g: gSigma5m, fMinusG: fMinusGSigma5m } = rollingGFromPriorF(pastSigma5mF, fSigma5m);
 
@@ -250,16 +266,31 @@ function computeRows(
           })
         : null;
 
+    const yesTokenPriceDeribitIv = directionalYesExecutionPrice(
+      fairValueDeribitIv,
+      row.yesBid,
+      row.yesAsk,
+    );
     const fDeribitIv =
-      fairValueDeribitIv !== null ? fairValueDeribitIv - yesTokenPrice : null;
+      fairValueDeribitIv !== null ? fairValueDeribitIv - yesTokenPriceDeribitIv : null;
     const { g: gDeribitIv, fMinusG: fMinusGDeribitIv } = rollingGFromPriorF(pastDeribitF, fDeribitIv);
 
+    const yesTokenPriceMeanFv = directionalYesExecutionPrice(
+      fairValueBlendedSigma,
+      row.yesBid,
+      row.yesAsk,
+    );
     const fMeanFv =
-      fairValueBlendedSigma !== null ? fairValueBlendedSigma - yesTokenPrice : null;
+      fairValueBlendedSigma !== null ? fairValueBlendedSigma - yesTokenPriceMeanFv : null;
     const { g: gMeanFv, fMinusG: fMinusGMeanFv } = rollingGFromPriorF(pastMeanFvF, fMeanFv);
+    const yesTokenPriceSigma10m = directionalYesExecutionPrice(
+      row.fairValueSigma10m,
+      row.yesBid,
+      row.yesAsk,
+    );
     const fSigma10m =
       row.fairValueSigma10m !== null && row.fairValueSigma10m !== undefined
-        ? row.fairValueSigma10m - yesTokenPrice
+        ? row.fairValueSigma10m - yesTokenPriceSigma10m
         : null;
     const { g: gSigma10m, fMinusG: fMinusGSigma10m } = rollingGFromPriorF(pastSigma10mF, fSigma10m);
 
