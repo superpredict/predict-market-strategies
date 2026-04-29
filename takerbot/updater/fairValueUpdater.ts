@@ -227,6 +227,14 @@ async function computeAndPublish(
     return;
   }
 
+  // ── Catch binance timestamp mismatch issue ──────────────────────────────────
+  if (binanceFeed.ts > now) {
+    console.log(
+      `[fairValueUpdater] BINANCE TIMESTAMP MISMATCH (${binanceFeed.ts} > ${now}) — forbidden`
+    );
+    return;
+  }
+
   // ── Oracle payload lag (Chainlink path: forbid run; orderbook: skip report below) ──
   if (trigger === 'chainlink') {
     const oracleLagMs = now - btcFeed.chainlinkTs;
