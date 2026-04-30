@@ -17,21 +17,16 @@ export interface PriceTick {
  */
 export class EWMAVolatility {
   private readonly lambda: number;
-  private readonly minTicks: number;
   private lastPrice: number | null = null;
   private lastTimestampMs: number | null = null;
   private variance = 0;
   private initialized = false;
-  private tickCount = 0;
 
-  constructor({ lambda, minTicks }: { lambda: number; minTicks: number }) {
+  constructor({ lambda }: { lambda: number }) {
     this.lambda = lambda;
-    this.minTicks = minTicks;
   }
 
   update(price: number, timestampMs: number): number {
-    this.tickCount++;
-
     if (this.lastPrice === null || this.lastTimestampMs === null) {
       this.lastPrice = price;
       this.lastTimestampMs = timestampMs;
@@ -68,13 +63,5 @@ export class EWMAVolatility {
 
   getVolatility(): number {
     return this.initialized ? Math.sqrt(this.variance) : 0;
-  }
-
-  getTickCount(): number {
-    return this.tickCount;
-  }
-
-  isReady(): boolean {
-    return this.initialized && this.tickCount >= this.minTicks;
   }
 }

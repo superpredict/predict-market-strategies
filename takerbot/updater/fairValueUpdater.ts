@@ -31,7 +31,6 @@ import {
   STOP_TRADING_BEFORE_EXPIRY_MS,
   VERBOSE,
   VOLATILITY_EWMA_LAMBDA,
-  VOLATILITY_MIN_TICKS,
 } from '../config/constants.js';
 import { EWMAVolatility } from '../shared/ewmaVolatility.js';
 import { closeRedis, getRedisClient, getSubscriberClient } from '../shared/redis.js';
@@ -65,19 +64,9 @@ let STRIKE_PRICE: number | null = null;
 let EXPIRY_TS: number | null = null;
 let lastReportYesBid: number | null = null;
 let lastReportYesAsk: number | null = null;
-const volatilityEstimator = new EWMAVolatility({
-  lambda: VOLATILITY_EWMA_LAMBDA,
-  minTicks: VOLATILITY_MIN_TICKS,
-});
-const volatilityEstimator5m = new EWMAVolatility({
-  lambda: VOLATILITY_EWMA_LAMBDA,
-  minTicks: VOLATILITY_MIN_TICKS,
-});
-const volatilityEstimator10m = new EWMAVolatility({
-  lambda: VOLATILITY_EWMA_LAMBDA,
-  minTicks: VOLATILITY_MIN_TICKS,
-});
-let sigmaNotReadyLogged = false;
+const volatilityEstimator = new EWMAVolatility({ lambda: VOLATILITY_EWMA_LAMBDA });
+const volatilityEstimator5m = new EWMAVolatility({ lambda: VOLATILITY_EWMA_LAMBDA });
+const volatilityEstimator10m = new EWMAVolatility({ lambda: VOLATILITY_EWMA_LAMBDA });
 const ZERO_PRICE_ANOMALY_JUMP = 0.2;
 const FIVE_MINUTES_MS = 5 * 60_000;
 const TEN_MINUTES_MS = 10 * 60_000;
@@ -158,16 +147,12 @@ function sanitizeYesTopOfBook(yesBid: number, yesAsk: number): { yesBid: number;
 
 function getCurrentSigmaPerSecond(): number | null {
   const sigma = volatilityEstimator.getVolatility();
-  if (!volatilityEstimator.isReady() || sigma <= 0) {
-    return null;
-  }
-  return sigma;
+  return sigma > 0 ? sigma : null;
 }
 
 function getCurrentSigmaFrom(estimator: EWMAVolatility): number | null {
   const sigma = estimator.getVolatility();
-  if (!estimator.isReady() || sigma <= 0) return null;
-  return sigma;
+  return sigma > 0 ? sigma : null;
 }
 
 async function warmVolatilityEstimator(): Promise<void> {
@@ -259,17 +244,7 @@ async function computeAndPublish(
   if (timeToExpiryMs < STOP_TRADING_BEFORE_EXPIRY_MS) return;
 
   const sigmaPerSecond = getCurrentSigmaPerSecond();
-  if (sigmaPerSecond === null) {
-    if (!sigmaNotReadyLogged) {
-      console.log(
-        `[fairValueUpdater] EWMA sigma not ready yet ` +
-        `(ticks=${volatilityEstimator.getTickCount()} < min=${VOLATILITY_MIN_TICKS})`
-      );
-      sigmaNotReadyLogged = true;
-    }
-    return;
-  }
-  sigmaNotReadyLogged = false;
+  if (sigmaPerSecond === null) return;
 
   const value = computeBaseFairValue({
     currentPrice: binanceFeed.price,

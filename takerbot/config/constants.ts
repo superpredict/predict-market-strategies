@@ -21,9 +21,6 @@ export const MAX_EXPOSURE_USDC = 200;
 /** EWMA decay factor for BTC volatility estimation from Chainlink tick data. */
 export const VOLATILITY_EWMA_LAMBDA = 0.94;
 
-/** Minimum tick count before the per-second EWMA sigma is considered usable. */
-export const VOLATILITY_MIN_TICKS = 3;
-
 /** Minimum model confidence (0–1) required to trade. */
 export const MIN_CONFIDENCE = 0.18;
 
