@@ -73,6 +73,7 @@ function connect(): void {
 
   ws.on('close', (code) => {
     console.warn(`[chainlinkPriceFeeder] disconnected (code: ${code}), will reconnect…`);
+    console.warn(`[chainlinkPriceFeeder] current time: ${Date.now()}`);
     scheduleReconnect();
   });
 }
