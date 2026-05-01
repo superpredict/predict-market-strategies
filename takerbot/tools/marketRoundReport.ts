@@ -160,12 +160,43 @@ function sigmaRegimeOk(
   return current >= med * SIGNAL_SIGMA_MIN_RATIO && current <= med * SIGNAL_SIGMA_MAX_RATIO;
 }
 
-function deribitRegimeOk(deribitAnnualVolatility: number | null): boolean {
-  return (
-    deribitAnnualVolatility !== null &&
-    Number.isFinite(deribitAnnualVolatility) &&
-    deribitAnnualVolatility > 0
-  );
+function deribitRegimeOk(
+  rows: ComputedReportRow[],
+  index: number,
+  deribitAnnualVolatility: number | null,
+): boolean {
+  if (
+    deribitAnnualVolatility === null ||
+    !Number.isFinite(deribitAnnualVolatility) ||
+    deribitAnnualVolatility <= 0
+  ) {
+    return false;
+  }
+  const row = rows[index];
+  if (
+    !row ||
+    row.fDeribitIv === null ||
+    row.gDeribitIv === null ||
+    row.fMinusGDeribitIv === null ||
+    !Number.isFinite(row.fDeribitIv) ||
+    !Number.isFinite(row.gDeribitIv) ||
+    !Number.isFinite(row.fMinusGDeribitIv)
+  ) {
+    return false;
+  }
+  // Deribit-only regime: use rolling |f_deribit_iv| stability band.
+  const from = Math.max(0, index - SIGNAL_SIGMA_MEDIAN_WINDOW + 1);
+  const absFHist: number[] = [];
+  for (let i = from; i <= index; i++) {
+    const f = rows[i]?.fDeribitIv;
+    if (f !== null && f !== undefined && Number.isFinite(f)) absFHist.push(Math.abs(f));
+  }
+  const minSamples = Math.min(5, Math.max(3, Math.floor(SIGNAL_SIGMA_MEDIAN_WINDOW / 6)));
+  if (absFHist.length < minSamples) return false;
+  const medAbsF = median(absFHist);
+  if (!Number.isFinite(medAbsF) || medAbsF <= 0) return false;
+  const curAbsF = Math.abs(row.fDeribitIv);
+  return curAbsF >= medAbsF * SIGNAL_SIGMA_MIN_RATIO && curAbsF <= medAbsF * SIGNAL_SIGMA_MAX_RATIO;
 }
 
 function computeTradeSignal(
@@ -336,7 +367,7 @@ function computeRows(
     if (!row) continue;
     const sigma5mPass = sigmaRegimeOk(computed, i, 'annualizedSigma5m');
     const sigma10mPass = sigmaRegimeOk(computed, i, 'annualizedSigma10m');
-    const deribitPass = deribitRegimeOk(deribitAnnualVolatility);
+    const deribitPass = deribitRegimeOk(computed, i, deribitAnnualVolatility);
     row.tradeSignalSigma5m = computeTradeSignal(row, row.fSigma5m, row.fMinusGSigma5m, sigma5mPass);
     row.tradeSignalSigma10m = computeTradeSignal(
       row,

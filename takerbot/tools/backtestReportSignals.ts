@@ -392,8 +392,38 @@ function sigmaRegimeOk(
   return cur >= med * minRatio && cur <= med * maxRatio;
 }
 
-function deribitRegimeOk(row: CsvRow): boolean {
-  return row.fDeribitIv !== null && row.fMinusGDeribitIv !== null;
+function deribitRegimeOk(
+  rows: CsvRow[],
+  i: number,
+  window: number,
+  minRatio: number,
+  maxRatio: number,
+): boolean {
+  const row = rows[i];
+  if (!row) return false;
+  if (
+    row.fDeribitIv === null ||
+    row.gDeribitIv === null ||
+    row.fMinusGDeribitIv === null ||
+    !Number.isFinite(row.fDeribitIv) ||
+    !Number.isFinite(row.gDeribitIv) ||
+    !Number.isFinite(row.fMinusGDeribitIv)
+  ) {
+    return false;
+  }
+  // Deribit-only regime: constrain current |f| within rolling median-scaled band.
+  const lo = Math.max(0, i - window + 1);
+  const histAbsF: number[] = [];
+  for (let j = lo; j <= i; j++) {
+    const f = rows[j]?.fDeribitIv;
+    if (f !== null && f !== undefined && Number.isFinite(f)) histAbsF.push(Math.abs(f));
+  }
+  const minSamples = Math.min(5, Math.max(3, Math.floor(window / 6)));
+  if (histAbsF.length < minSamples) return false;
+  const medAbsF = median(histAbsF);
+  if (!Number.isFinite(medAbsF) || medAbsF <= 0) return false;
+  const curAbsF = Math.abs(row.fDeribitIv);
+  return curAbsF >= medAbsF * minRatio && curAbsF <= medAbsF * maxRatio;
 }
 
 function runBacktestOnRows(
@@ -496,7 +526,13 @@ function runBacktestOnRows(
               args.sigmaMinRatio,
               args.sigmaMaxRatio,
             )
-          : deribitRegimeOk(r);
+          : deribitRegimeOk(
+              rows,
+              i,
+              args.sigmaMedianWindow,
+              args.sigmaMinRatio,
+              args.sigmaMaxRatio,
+            );
 
     const room = args.maxYesShares - positionYes;
 
