@@ -44,6 +44,7 @@ fi
 # current file, then start fresh so script/interpreter updates always apply.
 echo "[4/4] applying PM2 ecosystem…"
 ECOSYSTEM="takerbot/ecosystem.config.cjs"
+node deploy/scripts/verify-pm2-ecosystem.cjs
 APP_NAMES="$(
   node -e "
     const e = require('./$ECOSYSTEM');

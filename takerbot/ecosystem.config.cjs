@@ -11,12 +11,31 @@
 
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
-// PM2 runs `script` with Node by default. `node_modules/.bin/tsx` is a shell shim;
-// use the real CLI module so Node executes JS, not sh.
-const TSX_CLI = require.resolve('tsx/cli', { paths: [ROOT] });
+
+/**
+ * PM2 must never use `node_modules/.bin/tsx` as `script`: that file is a POSIX
+ * shell shim; PM2 runs it with Node and you get `SyntaxError` on `basedir=$(`.
+ * Use `dist/cli.mjs` (absolute path). Prefer fork mode so PM2 does not wrap the
+ * process in cluster mode (which has been observed to keep stale exec paths).
+ */
+function resolveTsxCli(root) {
+  const direct = path.resolve(root, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  if (fs.existsSync(direct)) return direct;
+  try {
+    return require.resolve('tsx/cli', { paths: [root] });
+  } catch {
+    /* fall through */
+  }
+  throw new Error(
+    'tsx CLI not found (expected node_modules/tsx/dist/cli.mjs). Run `pnpm install` from repo root.',
+  );
+}
+
+const TSX_CLI = resolveTsxCli(ROOT);
 
 const prodEnv = {
   NODE_ENV: 'production',
@@ -39,6 +58,7 @@ module.exports = {
       interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/btcPriceFeeder.ts`,
       cwd: ROOT,
+      exec_mode: 'fork',
       instances: 1,
       autorestart: true,
       watch: false,
@@ -58,6 +78,7 @@ module.exports = {
       interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/chainlinkPriceFeeder.ts`,
       cwd: ROOT,
+      exec_mode: 'fork',
       instances: 1,
       autorestart: true,
       watch: false,
@@ -77,6 +98,7 @@ module.exports = {
       interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/marketDiscovery.ts`,
       cwd: ROOT,
+      exec_mode: 'fork',
       instances: 1,
       autorestart: true,
       watch: false,
@@ -96,6 +118,7 @@ module.exports = {
       interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/marketPriceFeeder.ts`,
       cwd: ROOT,
+      exec_mode: 'fork',
       instances: 1,
       autorestart: true,
       watch: false,
@@ -115,6 +138,7 @@ module.exports = {
       interpreter: 'node',
       args: `${ROOT}/takerbot/updater/fairValueUpdater.ts`,
       cwd: ROOT,
+      exec_mode: 'fork',
       instances: 1,
       autorestart: true,
       watch: false,
@@ -134,6 +158,7 @@ module.exports = {
     //   interpreter: 'node',
     //   args: `${ROOT}/takerbot/takerbot.ts`,
     //   cwd: ROOT,
+    //   exec_mode: 'fork',
     //   instances: 1,
     //   autorestart: true,
     //   watch: false,
@@ -151,6 +176,7 @@ module.exports = {
     //   interpreter: 'node',
     //   args: `${ROOT}/takerbot/portfolio/portfolioTracker.ts`,
     //   cwd: ROOT,
+    //   exec_mode: 'fork',
     //   instances: 1,
     //   autorestart: true,
     //   watch: false,

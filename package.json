@@ -22,6 +22,8 @@
     "start:pm2": "pm2 start takerbot/ecosystem.config.cjs",
     "stop:pm2": "pm2 stop takerbot/ecosystem.config.cjs",
     "typecheck": "tsc --noEmit",
+    "verify:pm2": "node deploy/scripts/verify-pm2-ecosystem.cjs",
+    "verify": "pnpm typecheck && pnpm verify:pm2",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "engines": {
