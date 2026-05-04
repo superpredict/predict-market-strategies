@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # deploy.sh
 #
-# Pull latest code, install dependencies, and reload PM2 processes.
+# Pull latest code, install dependencies, and apply the PM2 ecosystem (delete + start).
 # Run from the repo root on the VPS, or call from GitHub Actions.
 #
 #   bash deploy/scripts/deploy.sh
@@ -38,13 +38,24 @@ fi
 #   exit 1
 # fi
 
-# ── Reload PM2 ────────────────────────────────────────────────────────────────
-echo "[4/4] reloading PM2 processes…"
-if pm2 describe takerbot > /dev/null 2>&1; then
-  pm2 reload takerbot/ecosystem.config.cjs --env production
-else
-  pm2 start takerbot/ecosystem.config.cjs --env production
+# ── PM2: replace process list from ecosystem ──────────────────────────────────
+# `pm2 reload` can keep a stale `pm_exec_path` (e.g. still pointing at
+# `node_modules/.bin/tsx` after ecosystem changes). Delete apps declared in the
+# current file, then start fresh so script/interpreter updates always apply.
+echo "[4/4] applying PM2 ecosystem…"
+ECOSYSTEM="takerbot/ecosystem.config.cjs"
+APP_NAMES="$(
+  node -e "
+    const e = require('./$ECOSYSTEM');
+    if (!e.apps?.length) process.exit(0);
+    process.stdout.write(e.apps.map((a) => a.name).join(' '));
+  "
+)"
+if [ -n "${APP_NAMES:-}" ]; then
+  # shellcheck disable=SC2086
+  pm2 delete $APP_NAMES 2>/dev/null || true
 fi
+pm2 start "$ECOSYSTEM" --env production
 
 pm2 save
 
