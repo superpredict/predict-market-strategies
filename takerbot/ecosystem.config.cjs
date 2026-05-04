@@ -14,7 +14,9 @@
 const path = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
-const TSX = path.join(ROOT, 'node_modules/.bin/tsx');
+// PM2 runs `script` with Node by default. `node_modules/.bin/tsx` is a shell shim;
+// use the real CLI module so Node executes JS, not sh.
+const TSX_CLI = require.resolve('tsx/cli', { paths: [ROOT] });
 
 const prodEnv = {
   NODE_ENV: 'production',
@@ -33,7 +35,8 @@ module.exports = {
     // ── Shared: BTC price feeder (one instance) ────────────────────────────
     {
       name: 'btcPriceFeeder',
-      script: TSX,
+      script: TSX_CLI,
+      interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/btcPriceFeeder.ts`,
       cwd: ROOT,
       instances: 1,
@@ -51,7 +54,8 @@ module.exports = {
     // the latest BTC/USD price in Redis for monitoring/diagnostics.
     {
       name: 'chainlinkPriceFeeder',
-      script: TSX,
+      script: TSX_CLI,
+      interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/chainlinkPriceFeeder.ts`,
       cwd: ROOT,
       instances: 1,
@@ -69,7 +73,8 @@ module.exports = {
     // each new 15-min window so all other processes hot-swap automatically.
     {
       name: 'marketDiscovery',
-      script: TSX,
+      script: TSX_CLI,
+      interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/marketDiscovery.ts`,
       cwd: ROOT,
       instances: 1,
@@ -87,7 +92,8 @@ module.exports = {
     // each rotation.  No market-specific args needed.
     {
       name: 'marketPriceFeeder',
-      script: TSX,
+      script: TSX_CLI,
+      interpreter: 'node',
       args: `${ROOT}/takerbot/feeders/marketPriceFeeder.ts`,
       cwd: ROOT,
       instances: 1,
@@ -105,7 +111,8 @@ module.exports = {
     // rotation.  No market-specific args needed.
     {
       name: 'fairValueUpdater',
-      script: TSX,
+      script: TSX_CLI,
+      interpreter: 'node',
       args: `${ROOT}/takerbot/updater/fairValueUpdater.ts`,
       cwd: ROOT,
       instances: 1,
@@ -123,7 +130,8 @@ module.exports = {
     // // each rotation.  No market-specific args needed.
     // {
     //   name: 'takerbot',
-    //   script: TSX,
+    //   script: TSX_CLI,
+    //   interpreter: 'node',
     //   args: `${ROOT}/takerbot/takerbot.ts`,
     //   cwd: ROOT,
     //   instances: 1,
@@ -139,7 +147,8 @@ module.exports = {
     // // ── Shared: Portfolio tracker (one instance) ───────────────────────────
     // {
     //   name: 'portfolioTracker',
-    //   script: TSX,
+    //   script: TSX_CLI,
+    //   interpreter: 'node',
     //   args: `${ROOT}/takerbot/portfolio/portfolioTracker.ts`,
     //   cwd: ROOT,
     //   instances: 1,
