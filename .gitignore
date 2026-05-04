@@ -32,3 +32,4 @@ coverage/
 *.temp
 .cache/
 .npmrc
+.pnpm-store/

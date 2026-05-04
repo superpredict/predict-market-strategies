@@ -118,38 +118,38 @@ module.exports = {
       env_production: prodEnv,
     },
 
-    // ── Shared: Taker strategy (one instance) ──────────────────────────────
-    // Subscribes to market:new-active-market and restarts TakerStrategy on
-    // each rotation.  No market-specific args needed.
-    {
-      name: 'takerbot',
-      script: TSX,
-      args: `${ROOT}/takerbot/takerbot.ts`,
-      cwd: ROOT,
-      instances: 1,
-      autorestart: true,
-      watch: false,
-      max_memory_restart: '256M',
-      restart_delay: 5000,
-      max_restarts: 20,
-      env: devEnv,
-      env_production: prodEnv,
-    },
+    // // ── Shared: Taker strategy (one instance) ──────────────────────────────
+    // // Subscribes to market:new-active-market and restarts TakerStrategy on
+    // // each rotation.  No market-specific args needed.
+    // {
+    //   name: 'takerbot',
+    //   script: TSX,
+    //   args: `${ROOT}/takerbot/takerbot.ts`,
+    //   cwd: ROOT,
+    //   instances: 1,
+    //   autorestart: true,
+    //   watch: false,
+    //   max_memory_restart: '256M',
+    //   restart_delay: 5000,
+    //   max_restarts: 20,
+    //   env: devEnv,
+    //   env_production: prodEnv,
+    // },
 
-    // ── Shared: Portfolio tracker (one instance) ───────────────────────────
-    {
-      name: 'portfolioTracker',
-      script: TSX,
-      args: `${ROOT}/takerbot/portfolio/portfolioTracker.ts`,
-      cwd: ROOT,
-      instances: 1,
-      autorestart: true,
-      watch: false,
-      max_memory_restart: '128M',
-      restart_delay: 3000,
-      max_restarts: 20,
-      env: devEnv,
-      env_production: prodEnv,
-    },
+    // // ── Shared: Portfolio tracker (one instance) ───────────────────────────
+    // {
+    //   name: 'portfolioTracker',
+    //   script: TSX,
+    //   args: `${ROOT}/takerbot/portfolio/portfolioTracker.ts`,
+    //   cwd: ROOT,
+    //   instances: 1,
+    //   autorestart: true,
+    //   watch: false,
+    //   max_memory_restart: '128M',
+    //   restart_delay: 3000,
+    //   max_restarts: 20,
+    //   env: devEnv,
+    //   env_production: prodEnv,
+    // },
   ],
 };
