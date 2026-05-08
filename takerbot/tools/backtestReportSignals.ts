@@ -18,8 +18,8 @@ import { STOP_TRADING_BEFORE_EXPIRY_MS } from '../config/constants.js';
 
 const REPORTS_DIR = resolve(process.cwd(), 'takerbot', 'reports');
 
-const DEFAULT_DELTA = 0.05;
-const DEFAULT_GAMMA = 0.03;
+const DEFAULT_DELTA = 0.06;
+const DEFAULT_GAMMA = 0.04;
 const DEFAULT_MIN_CONFIDENCE = 0.18;
 /** Require more than this many ms remaining (default 1 minute). */
 const DEFAULT_MIN_TIME_TO_EXPIRY_MS = STOP_TRADING_BEFORE_EXPIRY_MS;

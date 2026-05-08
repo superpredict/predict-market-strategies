@@ -104,8 +104,8 @@ function fileExists(path: string): Promise<boolean> {
 
 /** g(t) = mean(f(t−1)…f(t−10)); clears history when the current f is null (no Deribit / blended FV). */
 const G_PRIOR_SAMPLES = 10;
-const SIGNAL_DELTA = 0.05;
-const SIGNAL_GAMMA = 0.03;
+const SIGNAL_DELTA = 0.06;
+const SIGNAL_GAMMA = 0.04;
 const SIGNAL_MAX_YES_SPREAD = 0.08;
 const SIGNAL_SIGMA_MEDIAN_WINDOW = 31;
 const SIGNAL_SIGMA_MIN_RATIO = 0.35;
