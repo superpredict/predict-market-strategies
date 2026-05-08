@@ -14,7 +14,7 @@
 
 import { readdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { STOP_TRADING_BEFORE_EXPIRY_MS } from '../config/constants.js';
+import { STOP_TRADING_BEFORE_EXPIRY_MS, TAKER_FEE_RATE } from '../config/constants.js';
 
 const REPORTS_DIR = resolve(process.cwd(), 'takerbot', 'reports');
 
@@ -288,6 +288,7 @@ interface BuyFill {
   entryIso: string;
   qty: number;
   entryYesAsk: number;
+  entryYesAskFeeAdj: number;
   f: number;
   g: number;
   fMinusG: number;
@@ -309,6 +310,7 @@ interface ShortFill {
   entryRowIndex: number;
   entryIso: string;
   entryYesBid: number;
+  entryYesBidFeeAdj: number;
   f: number;
   g: number;
   fMinusG: number;
@@ -543,6 +545,7 @@ function runBacktestOnRows(
         entryIso: r.isoTime,
         qty,
         entryYesAsk: r.yesAsk,
+        entryYesAskFeeAdj: r.yesAsk * (1 + TAKER_FEE_RATE),
         f: fields.f,
         g: fields.g,
         fMinusG: fields.fMinusG,
@@ -561,6 +564,7 @@ function runBacktestOnRows(
         entryRowIndex: i,
         entryIso: r.isoTime,
         entryYesBid: r.yesBid,
+        entryYesBidFeeAdj: r.yesBid * (1 - TAKER_FEE_RATE),
         f: fields.f,
         g: fields.g,
         fMinusG: fields.fMinusG,
@@ -572,7 +576,7 @@ function runBacktestOnRows(
   let buyScaled: BuyScaledResult | null = null;
   if (buyFills.length > 0) {
     const totalShares = buyFills.reduce((s, f) => s + f.qty, 0);
-    const totalCost = buyFills.reduce((s, f) => s + f.qty * f.entryYesAsk, 0);
+    const totalCost = buyFills.reduce((s, f) => s + f.qty * f.entryYesAskFeeAdj, 0);
     const pnl = yesPayoff * totalShares - totalCost;
     buyScaled = {
       slug,
@@ -590,7 +594,7 @@ function runBacktestOnRows(
   let shortScaled: ShortScaledResult | null = null;
   if (shortFills.length > 0) {
     const totalShares = shortFills.length;
-    const totalCredit = shortFills.reduce((s, f) => s + f.entryYesBid, 0);
+    const totalCredit = shortFills.reduce((s, f) => s + f.entryYesBidFeeAdj, 0);
     const pnl = totalCredit - yesPayoff * totalShares;
     shortScaled = {
       slug,
@@ -732,6 +736,7 @@ function buildCombinedMarkdown(args: CliArgs, runs: VariantRunResult[], outputNa
   lines.push(`- min confidence: **${args.minConfidence}** (currently informational; signal already pre-filtered in report)`);
   lines.push(`- min time-to-expiry (ms): **${args.minTimeToExpiryMs}** (must be strictly greater than this)`);
   lines.push(`- max YES spread (ask−bid): **${args.maxYesSpread}**`);
+  lines.push(`- taker fee rate: **${(TAKER_FEE_RATE * 100).toFixed(2)}%** (applied on entries)`);
   lines.push(`- max cumulative shares per side (long cap / short cap): **${args.maxYesShares}**`);
   lines.push(`- sigma median window: **${args.sigmaMedianWindow}**, ratio band: **[${args.sigmaMinRatio}, ${args.sigmaMaxRatio}]× median**`);
   lines.push(`- reports directory: \`${args.reportsDir}\``);

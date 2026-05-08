@@ -13,6 +13,9 @@ export const POSITION_SIZE_USDC = 50;
 /** Minimum edge (0–1) required before placing a taker order. 0.03 = 3%. */
 export const EDGE_THRESHOLD = 0.03;
 
+/** Taker fee rate applied on each fill (0–1). 0.018 = 1.8%. */
+export const TAKER_FEE_RATE = 0.018;
+
 /** Maximum open USDC exposure per market. */
 export const MAX_EXPOSURE_USDC = 200;
 

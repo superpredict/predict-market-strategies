@@ -147,6 +147,8 @@ export interface MarketConfig {
   edgeThreshold: number;
   /** Maximum concurrent USDC exposure in this market */
   maxExposureUsdc: number;
+  /** Taker fee rate per fill (0–1). */
+  takerFeeRate: number;
   /** When true, log actions but never submit real orders */
   dryRun: boolean;
 }

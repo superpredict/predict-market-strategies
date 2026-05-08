@@ -9,6 +9,7 @@ import {
   MIN_MARKET_LIQUIDITY,
   MIN_TIME_TO_EXPIRY_MS,
   POSITION_SIZE_USDC,
+  TAKER_FEE_RATE,
 } from './constants.js';
 
 dotenv.config();
@@ -75,6 +76,7 @@ export async function findActiveBtc15MinMarket(
     positionSizeUsdc: POSITION_SIZE_USDC,
     edgeThreshold: EDGE_THRESHOLD,
     maxExposureUsdc: MAX_EXPOSURE_USDC,
+    takerFeeRate: TAKER_FEE_RATE,
     dryRun: DRY_RUN,
   };
 
@@ -110,6 +112,7 @@ export async function buildMarketConfig(
     positionSizeUsdc: POSITION_SIZE_USDC,
     edgeThreshold: EDGE_THRESHOLD,
     maxExposureUsdc: MAX_EXPOSURE_USDC,
+    takerFeeRate: TAKER_FEE_RATE,
     dryRun: DRY_RUN,
   };
 }
@@ -145,6 +148,7 @@ export function buildMarketConfigFromInfo(info: ActiveMarketInfo): MarketConfig 
     positionSizeUsdc: POSITION_SIZE_USDC,
     edgeThreshold: EDGE_THRESHOLD,
     maxExposureUsdc: MAX_EXPOSURE_USDC,
+    takerFeeRate: TAKER_FEE_RATE,
     dryRun: DRY_RUN,
   };
 }
