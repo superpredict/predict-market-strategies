@@ -44,7 +44,20 @@ fi
 # current file, then start fresh so script/interpreter updates always apply.
 echo "[4/4] applying PM2 ecosystem…"
 ECOSYSTEM="takerbot/ecosystem.config.cjs"
-node deploy/scripts/verify-pm2-ecosystem.cjs
+node -e "
+  const e = require('./$ECOSYSTEM');
+  for (const a of e.apps || []) {
+    const s = String(a.script || '');
+    if (s.includes('/.bin/tsx')) {
+      console.error('ERROR: app', a.name, 'must not use node_modules/.bin/tsx (shell shim). Got:', s);
+      process.exit(1);
+    }
+    if (!s.endsWith('cli.mjs')) {
+      console.error('ERROR: app', a.name, 'script must be tsx dist/cli.mjs. Got:', s);
+      process.exit(1);
+    }
+  }
+"
 APP_NAMES="$(
   node -e "
     const e = require('./$ECOSYSTEM');
