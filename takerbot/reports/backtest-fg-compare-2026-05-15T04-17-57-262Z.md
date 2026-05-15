@@ -1,8 +1,9 @@
 # Report backtest compare: variants (a)/(b)/(c)
 
-- generated: 2026-05-15T04:01:22.737Z
-- output: `takerbot/reports/backtest-fg-compare-2026-05-15T04-01-17-429Z.md`
+- generated: 2026-05-15T04:18:02.702Z
+- output: `takerbot/reports/backtest-fg-compare-2026-05-15T04-17-57-262Z.md`
 - source reports: all `*.csv` in reports dir (excluding names starting with `backtest-`)
+- total runs (one per source CSV): **622**
 
 ## Parameters used in this run
 

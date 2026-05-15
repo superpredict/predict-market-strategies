@@ -722,11 +722,13 @@ function appendVariantSection(lines: string[], run: VariantRunResult): void {
 
 function buildCombinedMarkdown(args: CliArgs, runs: VariantRunResult[], outputName: string): string {
   const lines: string[] = [];
+  const totalRuns = runs[0]?.results.length ?? 0;
   lines.push('# Report backtest compare: variants (a)/(b)/(c)');
   lines.push('');
   lines.push(`- generated: ${new Date().toISOString()}`);
   lines.push(`- output: \`takerbot/reports/${outputName}\``);
   lines.push(`- source reports: all \`*.csv\` in reports dir (excluding names starting with \`backtest-\`)`);
+  lines.push(`- total runs (one per source CSV): **${totalRuns}**`);
   lines.push('');
 
   lines.push('## Parameters used in this run');
