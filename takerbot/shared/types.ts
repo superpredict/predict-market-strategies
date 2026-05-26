@@ -64,6 +64,10 @@ export interface MarketReportPoint {
   fairValueSigma1m?: number | null;
   /** Fair value computed with sigma10m (same Black–Scholes contract). */
   fairValueSigma10m: number | null;
+  /** Fair value with Deribit-blended σ for sigma5m (from fairValueUpdater). */
+  fairValueSigma5mForFv?: number | null;
+  /** Fair value with Deribit-blended σ for sigma10m (from fairValueUpdater). */
+  fairValueSigma10mForFv?: number | null;
   /** Chainlink BTC/USD spot used for the EWMA fair value model (S in Black–Scholes). */
   btcPrice: number;
   /** Chainlink payload timestamp (epoch ms) used by volatility estimator updates. */

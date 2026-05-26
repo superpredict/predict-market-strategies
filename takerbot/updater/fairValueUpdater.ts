@@ -12,6 +12,7 @@
  *   S = current Binance BTC/USDC price
  *   T = time-to-expiry in seconds
  *   σ = per-second EWMA volatility from Chainlink tick data
+ *   σ5m/σ10m FV tracks blend coarse EWMA with Deribit mark IV when available
  *
  * Chainlink staleness guard:
  *   If the BTC feed is older than BTC_STALE_FORBID_MS, trading is hard-forbidden
@@ -34,7 +35,7 @@ import {
 } from '../config/constants.js';
 import { EWMAVolatility } from '../shared/ewmaVolatility.js';
 import { closeRedis, getRedisClient, getSubscriberClient } from '../shared/redis.js';
-import { computeBaseFairValue, computeFairValueConfidence } from '../shared/fairValueMath.js';
+import { computeBaseFairValue, computeFairValueConfidence, adjustedPerSecondVolatilityFromCoarseAndDeribit } from '../shared/fairValueMath.js';
 import {
   appendMarketReportRow,
   getActiveMarket,
@@ -62,6 +63,8 @@ type FairValueComputeTrigger = 'chainlink' | 'orderbook';
 let MARKET_ID: string | null = null;
 let STRIKE_PRICE: number | null = null;
 let EXPIRY_TS: number | null = null;
+/** Deribit mark IV (annualized fraction) for the active window; from marketDiscovery. */
+let DERIBIT_MARK_IV_ANNUAL: number | null = null;
 let lastReportYesBid: number | null = null;
 let lastReportYesAsk: number | null = null;
 const volatilityEstimator = new EWMAVolatility({ lambda: VOLATILITY_EWMA_LAMBDA });
@@ -155,6 +158,21 @@ function getCurrentSigmaFrom(estimator: EWMAVolatility): number | null {
   return sigma > 0 ? sigma : null;
 }
 
+function perSecondVolatilityForCoarseFairValue(
+  coarsePerSecond: number | null,
+  deribitMarkIvAnnual: number | null,
+): number | null {
+  if (coarsePerSecond === null) return null;
+  if (
+    deribitMarkIvAnnual !== null &&
+    deribitMarkIvAnnual > 0 &&
+    Number.isFinite(deribitMarkIvAnnual)
+  ) {
+    return adjustedPerSecondVolatilityFromCoarseAndDeribit(coarsePerSecond, deribitMarkIvAnnual);
+  }
+  return coarsePerSecond;
+}
+
 async function warmVolatilityEstimator(): Promise<void> {
   const history = await getChainlinkBtcPriceHistory();
   if (history.length === 0) {
@@ -190,6 +208,7 @@ async function warmVolatilityEstimator(): Promise<void> {
 async function computeAndPublish(
   btcFeed: ChainlinkBtcPriceFeed,
   obFeed: MarketOrderbookFeed,
+  deribitMarkIvAnnual: number | null,
   trigger: FairValueComputeTrigger = 'orderbook'
 ): Promise<void> {
   if (!MARKET_ID) return;
@@ -246,6 +265,10 @@ async function computeAndPublish(
   });
   const sigma5m = getCurrentSigmaFrom(volatilityEstimator5m);
   const sigma10m = getCurrentSigmaFrom(volatilityEstimator10m);
+  // Do the sigma adjustment for #L add more than #S adds issue
+  const sigma5mForFv = perSecondVolatilityForCoarseFairValue(sigma5m, deribitMarkIvAnnual);
+  const sigma10mForFv = perSecondVolatilityForCoarseFairValue(sigma10m, deribitMarkIvAnnual);
+
   const fairValueSigma5m =
     sigma5m !== null
       ? computeBaseFairValue({
@@ -255,6 +278,15 @@ async function computeAndPublish(
           perSecondVolatility: sigma5m,
         })
       : null;
+  const fairValueSigma5mForFv =
+    sigma5mForFv !== null
+      ? computeBaseFairValue({
+          currentPrice: binanceFeed.price,
+          strikePrice: STRIKE_PRICE,
+          timeToExpiryMs,
+          perSecondVolatility: sigma5mForFv,
+        })
+      : null;
   const fairValueSigma10m =
     sigma10m !== null
       ? computeBaseFairValue({
@@ -262,6 +294,15 @@ async function computeAndPublish(
           strikePrice: STRIKE_PRICE,
           timeToExpiryMs,
           perSecondVolatility: sigma10m,
+        })
+      : null;
+  const fairValueSigma10mForFv =
+    sigma10mForFv !== null
+      ? computeBaseFairValue({
+          currentPrice: binanceFeed.price,
+          strikePrice: STRIKE_PRICE,
+          timeToExpiryMs,
+          perSecondVolatility: sigma10mForFv,
         })
       : null;
   const { confidence, timeBonus, atFloor } = computeFairValueConfidence(
@@ -329,6 +370,8 @@ async function computeAndPublish(
       ts: now,
       fairValueSigma5m,
       fairValueSigma10m,
+      fairValueSigma5mForFv,
+      fairValueSigma10mForFv,
     });
   } else if (VERBOSE) {
     console.log(
@@ -382,6 +425,12 @@ async function rotateToMarket(
   MARKET_ID = newMarketId;
   EXPIRY_TS = info.expiryTs;
   STRIKE_PRICE = info.strikePrice; // set by marketDiscovery from Vatic active target
+  DERIBIT_MARK_IV_ANNUAL =
+    typeof info.deribitMarkIvAnnual === 'number' &&
+    Number.isFinite(info.deribitMarkIvAnnual) &&
+    info.deribitMarkIvAnnual > 0
+      ? info.deribitMarkIvAnnual
+      : null;
   lastReportYesBid = null;
   lastReportYesAsk = null;
 
@@ -392,6 +441,15 @@ async function rotateToMarket(
     );
   } else {
     console.log(`[fairValueUpdater] STRIKE_PRICE=$${STRIKE_PRICE.toFixed(2)} (from Vatic target)`);
+  }
+
+  if (DERIBIT_MARK_IV_ANNUAL !== null) {
+    console.log(
+      `[fairValueUpdater] deribitMarkIv=${(DERIBIT_MARK_IV_ANNUAL * 100).toFixed(2)}%` +
+      `${info.deribitInstrumentName ? ` (${info.deribitInstrumentName})` : ''}`
+    );
+  } else {
+    console.warn('[fairValueUpdater] deribitMarkIv unavailable — sigma5m/10m FV use raw EWMA only');
   }
 
   await sub.subscribe(REDIS_CHANNELS.orderbookUpdated(MARKET_ID));
@@ -442,12 +500,12 @@ async function start(): Promise<void> {
             }
             const obFeed = await getOrderbook(MARKET_ID);
             if (!obFeed) return;
-            await computeAndPublish(btcFeed, obFeed, 'chainlink');
+            await computeAndPublish(btcFeed, obFeed, DERIBIT_MARK_IV_ANNUAL, 'chainlink');
           } else if (channel === REDIS_CHANNELS.orderbookUpdated(MARKET_ID)) {
             const obFeed = JSON.parse(message) as MarketOrderbookFeed;
             const btcFeed = await getChainlinkBtcPrice();
             if (!btcFeed) return;
-            await computeAndPublish(btcFeed, obFeed, 'orderbook');
+            await computeAndPublish(btcFeed, obFeed, DERIBIT_MARK_IV_ANNUAL, 'orderbook');
           }
         } finally {
           isProcessing = false;

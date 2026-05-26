@@ -1,10 +1,12 @@
 /**
  * Backtest report signals on existing market round report CSVs.
  *
- * Runs three variants in one execution and writes one combined markdown report:
+ * Runs five variants in one execution and writes one combined markdown report:
  * - (a): sigma_5m track
  * - (b): sigma_10m track
  * - (c): deribit_iv track
+ * - (d): sigma_5m_for_fv track (Deribit-blended σ from fairValueUpdater)
+ * - (e): sigma_10m_for_fv track (Deribit-blended σ from fairValueUpdater)
  *
  * The output includes per-variant summaries and side-by-side comparison.
  *
@@ -53,7 +55,7 @@ interface CliArgs {
   sigmaMaxRatio: number;
 }
 
-type VariantKey = 'a' | 'b' | 'c';
+type VariantKey = 'a' | 'b' | 'c' | 'd' | 'e';
 
 interface VariantConfig {
   key: VariantKey;
@@ -88,6 +90,22 @@ const VARIANT_CONFIGS: VariantConfig[] = [
     fColumn: 'f_deribit_iv',
     gColumn: 'g_deribit_iv',
     fMinusGColumn: 'f_minus_g_deribit_iv',
+  },
+  {
+    key: 'd',
+    title: 'sigma_5m_for_fv',
+    signalColumn: 'trade_signal_sigma_5m_for_fv',
+    fColumn: 'f_sigma_5m_for_fv',
+    gColumn: 'g_sigma_5m_for_fv',
+    fMinusGColumn: 'f_minus_g_sigma_5m_for_fv',
+  },
+  {
+    key: 'e',
+    title: 'sigma_10m_for_fv',
+    signalColumn: 'trade_signal_sigma_10m_for_fv',
+    fColumn: 'f_sigma_10m_for_fv',
+    gColumn: 'g_sigma_10m_for_fv',
+    fMinusGColumn: 'f_minus_g_sigma_10m_for_fv',
   },
 ];
 
@@ -177,6 +195,12 @@ interface CsvRow {
   fSigma10m: number | null;
   gSigma10m: number | null;
   fMinusGSigma10m: number | null;
+  fSigma5mForFv: number | null;
+  gSigma5mForFv: number | null;
+  fMinusGSigma5mForFv: number | null;
+  fSigma10mForFv: number | null;
+  gSigma10mForFv: number | null;
+  fMinusGSigma10mForFv: number | null;
   fDeribitIv: number | null;
   gDeribitIv: number | null;
   fMinusGDeribitIv: number | null;
@@ -185,6 +209,8 @@ interface CsvRow {
   annualizedSigma10m: number | null;
   tradeSignalSigma5m: -1 | 0 | 1 | null;
   tradeSignalSigma10m: -1 | 0 | 1 | null;
+  tradeSignalSigma5mForFv: -1 | 0 | 1 | null;
+  tradeSignalSigma10mForFv: -1 | 0 | 1 | null;
   tradeSignalDeribitIv: -1 | 0 | 1 | null;
 }
 
@@ -218,11 +244,19 @@ function parseCsv(content: string): CsvRow[] {
     f10: idx('f_sigma_10m'),
     g10: idx('g_sigma_10m'),
     fg10: idx('f_minus_g_sigma_10m'),
+    f5Fv: idx('f_sigma_5m_for_fv'),
+    g5Fv: idx('g_sigma_5m_for_fv'),
+    fg5Fv: idx('f_minus_g_sigma_5m_for_fv'),
+    f10Fv: idx('f_sigma_10m_for_fv'),
+    g10Fv: idx('g_sigma_10m_for_fv'),
+    fg10Fv: idx('f_minus_g_sigma_10m_for_fv'),
     fDeribit: idx('f_deribit_iv'),
     gDeribit: idx('g_deribit_iv'),
     fgDeribit: idx('f_minus_g_deribit_iv'),
     signal5: idx('trade_signal_sigma_5m'),
     signal10: idx('trade_signal_sigma_10m'),
+    signal5Fv: idx('trade_signal_sigma_5m_for_fv'),
+    signal10Fv: idx('trade_signal_sigma_10m_for_fv'),
     signal: idx('trade_signal_deribit_iv'),
     tte: idx('time_to_expiry_ms'),
     sig5: idx('annualized_sigma_5m'),
@@ -238,6 +272,10 @@ function parseCsv(content: string): CsvRow[] {
     const fg5 = parseNum(cols[I.fg5]!);
     const g10 = parseNum(cols[I.g10]!);
     const fg10 = parseNum(cols[I.fg10]!);
+    const g5Fv = parseNum(cols[I.g5Fv]!);
+    const fg5Fv = parseNum(cols[I.fg5Fv]!);
+    const g10Fv = parseNum(cols[I.g10Fv]!);
+    const fg10Fv = parseNum(cols[I.fg10Fv]!);
     const gDeribit = parseNum(cols[I.gDeribit]!);
     const fgDeribit = parseNum(cols[I.fgDeribit]!);
     const tte = parseNum(cols[I.tte]!);
@@ -246,6 +284,8 @@ function parseCsv(content: string): CsvRow[] {
     const btcParsed = parseNum(cols[I.btc]!);
     const signal5 = parseNum(cols[I.signal5]!);
     const signal10 = parseNum(cols[I.signal10]!);
+    const signal5Fv = parseNum(cols[I.signal5Fv]!);
+    const signal10Fv = parseNum(cols[I.signal10Fv]!);
     const signal = parseNum(cols[I.signal]!);
     rows.push({
       isoTime: cols[I.iso]!,
@@ -261,6 +301,12 @@ function parseCsv(content: string): CsvRow[] {
       fSigma10m: parseNum(cols[I.f10]!),
       gSigma10m: g10,
       fMinusGSigma10m: fg10,
+      fSigma5mForFv: parseNum(cols[I.f5Fv]!),
+      gSigma5mForFv: g5Fv,
+      fMinusGSigma5mForFv: fg5Fv,
+      fSigma10mForFv: parseNum(cols[I.f10Fv]!),
+      gSigma10mForFv: g10Fv,
+      fMinusGSigma10mForFv: fg10Fv,
       fDeribitIv: parseNum(cols[I.fDeribit]!),
       gDeribitIv: gDeribit,
       fMinusGDeribitIv: fgDeribit,
@@ -271,6 +317,10 @@ function parseCsv(content: string): CsvRow[] {
         signal5 === 1 || signal5 === 0 || signal5 === -1 ? signal5 : null,
       tradeSignalSigma10m:
         signal10 === 1 || signal10 === 0 || signal10 === -1 ? signal10 : null,
+      tradeSignalSigma5mForFv:
+        signal5Fv === 1 || signal5Fv === 0 || signal5Fv === -1 ? signal5Fv : null,
+      tradeSignalSigma10mForFv:
+        signal10Fv === 1 || signal10Fv === 0 || signal10Fv === -1 ? signal10Fv : null,
       tradeSignalDeribitIv:
         signal === 1 || signal === 0 || signal === -1 ? signal : null,
     });
@@ -345,28 +395,43 @@ interface SelectedSignalFields {
 }
 
 function pickSignalFields(row: CsvRow, variant: VariantKey): SelectedSignalFields {
-  if (variant === 'a') {
-    return {
-      signal: row.tradeSignalSigma5m,
-      f: row.fSigma5m,
-      g: row.gSigma5m,
-      fMinusG: row.fMinusGSigma5m,
-    };
+  switch (variant) {
+    case 'a':
+      return {
+        signal: row.tradeSignalSigma5m,
+        f: row.fSigma5m,
+        g: row.gSigma5m,
+        fMinusG: row.fMinusGSigma5m,
+      };
+    case 'b':
+      return {
+        signal: row.tradeSignalSigma10m,
+        f: row.fSigma10m,
+        g: row.gSigma10m,
+        fMinusG: row.fMinusGSigma10m,
+      };
+    case 'd':
+      return {
+        signal: row.tradeSignalSigma5mForFv,
+        f: row.fSigma5mForFv,
+        g: row.gSigma5mForFv,
+        fMinusG: row.fMinusGSigma5mForFv,
+      };
+    case 'e':
+      return {
+        signal: row.tradeSignalSigma10mForFv,
+        f: row.fSigma10mForFv,
+        g: row.gSigma10mForFv,
+        fMinusG: row.fMinusGSigma10mForFv,
+      };
+    case 'c':
+      return {
+        signal: row.tradeSignalDeribitIv,
+        f: row.fDeribitIv,
+        g: row.gDeribitIv,
+        fMinusG: row.fMinusGDeribitIv,
+      };
   }
-  if (variant === 'b') {
-    return {
-      signal: row.tradeSignalSigma10m,
-      f: row.fSigma10m,
-      g: row.gSigma10m,
-      fMinusG: row.fMinusGSigma10m,
-    };
-  }
-  return {
-    signal: row.tradeSignalDeribitIv,
-    f: row.fDeribitIv,
-    g: row.gDeribitIv,
-    fMinusG: row.fMinusGDeribitIv,
-  };
 }
 
 function sigmaRegimeOk(
@@ -510,31 +575,25 @@ function runBacktestOnRows(
       r.timeToExpiryMs > args.minTimeToExpiryMs;
 
     const volOk =
-      variant === 'a'
-        ? sigmaRegimeOk(
+      variant === 'c'
+        ? deribitRegimeOk(
             rows,
             i,
-            (row) => row.annualizedSigma5m,
             args.sigmaMedianWindow,
             args.sigmaMinRatio,
             args.sigmaMaxRatio,
           )
-        : variant === 'b'
-          ? sigmaRegimeOk(
-              rows,
-              i,
-              (row) => row.annualizedSigma10m,
-              args.sigmaMedianWindow,
-              args.sigmaMinRatio,
-              args.sigmaMaxRatio,
-            )
-          : deribitRegimeOk(
-              rows,
-              i,
-              args.sigmaMedianWindow,
-              args.sigmaMinRatio,
-              args.sigmaMaxRatio,
-            );
+        : sigmaRegimeOk(
+            rows,
+            i,
+            (row) =>
+              variant === 'b' || variant === 'e'
+                ? row.annualizedSigma10m
+                : row.annualizedSigma5m,
+            args.sigmaMedianWindow,
+            args.sigmaMinRatio,
+            args.sigmaMaxRatio,
+          );
 
     const room = args.maxYesShares - positionYes;
 
@@ -723,7 +782,7 @@ function appendVariantSection(lines: string[], run: VariantRunResult): void {
 function buildCombinedMarkdown(args: CliArgs, runs: VariantRunResult[], outputName: string): string {
   const lines: string[] = [];
   const totalRuns = runs[0]?.results.length ?? 0;
-  lines.push('# Report backtest compare: variants (a)/(b)/(c)');
+  lines.push('# Report backtest compare: variants (a)/(b)/(c)/(d)/(e)');
   lines.push('');
   lines.push(`- generated: ${new Date().toISOString()}`);
   lines.push(`- output: \`takerbot/reports/${outputName}\``);
@@ -774,28 +833,35 @@ function buildCombinedMarkdown(args: CliArgs, runs: VariantRunResult[], outputNa
 
   lines.push('## Per-Market Compare (combined PnL)');
   lines.push('');
-  lines.push('| source CSV | payoff | (a) sigma_5m | (b) sigma_10m | (c) deribit_iv |');
-  lines.push('| --- | ---: | ---: | ---: | ---: |');
-  const aMap = new Map(runs.find((r) => r.config.key === 'a')?.results.map((r) => [r.source, r]) ?? []);
-  const bMap = new Map(runs.find((r) => r.config.key === 'b')?.results.map((r) => [r.source, r]) ?? []);
-  const cMap = new Map(runs.find((r) => r.config.key === 'c')?.results.map((r) => [r.source, r]) ?? []);
-  const allSources = new Set<string>([...Array.from(aMap.keys()), ...Array.from(bMap.keys()), ...Array.from(cMap.keys())]);
+  const perMarketHeader = [
+    'source CSV',
+    'payoff',
+    ...runs.map((run) => `(${run.config.key}) ${run.config.title}`),
+  ];
+  lines.push(`| ${perMarketHeader.join(' | ')} |`);
+  lines.push(`| ${perMarketHeader.map((_, idx) => (idx <= 1 ? '---:' : '---:')).join(' | ')} |`);
+  const runMaps = runs.map(
+    (run) => new Map(run.results.map((r) => [r.source, r])),
+  );
+  const allSources = new Set<string>();
+  for (const map of runMaps) {
+    for (const source of map.keys()) allSources.add(source);
+  }
+  const combined = (m: MarketRow | undefined) =>
+    m ? (m.buyScaled?.pnl ?? 0) + (m.shortScaled?.pnl ?? 0) : null;
   for (const source of Array.from(allSources).sort()) {
-    const a = aMap.get(source);
-    const b = bMap.get(source);
-    const c = cMap.get(source);
-    const payoff = a?.yesPayoff ?? b?.yesPayoff ?? c?.yesPayoff ?? null;
-    const combined = (m: MarketRow | undefined) => (m ? (m.buyScaled?.pnl ?? 0) + (m.shortScaled?.pnl ?? 0) : null);
-    const fa = combined(a);
-    const fb = combined(b);
-    const fc = combined(c);
+    const marketRows = runMaps.map((map) => map.get(source));
+    const payoff =
+      marketRows.find((m) => m?.yesPayoff !== null && m?.yesPayoff !== undefined)?.yesPayoff ??
+      null;
     lines.push(
       [
         `\`${source}\``,
         payoff === null ? '—' : String(payoff),
-        fa === null ? '—' : formatMoney(fa),
-        fb === null ? '—' : formatMoney(fb),
-        fc === null ? '—' : formatMoney(fc),
+        ...marketRows.map((m) => {
+          const pnl = combined(m);
+          return pnl === null ? '—' : formatMoney(pnl);
+        }),
       ].join(' | '),
     );
   }

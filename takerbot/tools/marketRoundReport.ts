@@ -66,6 +66,14 @@ interface ComputedReportRow extends MarketReportPoint {
   fSigma10m: number | null;
   gSigma10m: number | null;
   fMinusGSigma10m: number | null;
+  fSigma5mForFv: number | null;
+  gSigma5mForFv: number | null;
+  fMinusGSigma5mForFv: number | null;
+  fSigma10mForFv: number | null;
+  gSigma10mForFv: number | null;
+  fMinusGSigma10mForFv: number | null;
+  tradeSignalSigma5mForFv: -1 | 0 | 1;
+  tradeSignalSigma10mForFv: -1 | 0 | 1;
   /** f/g/f−g from blended σ (mean EWMA + Deribit) fair value (c). */
   fMeanFv: number | null;
   gMeanFv: number | null;
@@ -266,6 +274,8 @@ function computeRows(
   const pastDeribitF: number[] = [];
   const pastMeanFvF: number[] = [];
   const pastSigma10mF: number[] = [];
+  const pastSigma5mForFvF: number[] = [];
+  const pastSigma10mForFvF: number[] = [];
   const perSecondDeribitVolatility =
     deribitAnnualVolatility !== null ? perSecondVolatilityFromAnnual(deribitAnnualVolatility) : null;
 
@@ -387,6 +397,56 @@ function computeRows(
         : null;
     const { g: gSigma10m, fMinusG: fMinusGSigma10m } = rollingGFromPriorF(pastSigma10mF, fSigma10m);
 
+    const fairValueSigma5mForFv =
+      row.fairValueSigma5mForFv !== undefined ? row.fairValueSigma5mForFv : null;
+    const fairValueSigma10mForFv =
+      row.fairValueSigma10mForFv !== undefined ? row.fairValueSigma10mForFv : null;
+    const yesExecutionSideSigma5mForFv = directionalExecutionSide(
+      fairValueSigma5mForFv,
+      row.yesBid,
+      row.yesAsk,
+    );
+    const yesTokenPriceSigma5mForFv = directionalYesExecutionPrice(
+      fairValueSigma5mForFv,
+      row.yesBid,
+      row.yesAsk,
+    );
+    const yesTokenPriceSigma5mForFvFeeAdj = feeAdjustedYesExecutionPrice(
+      yesTokenPriceSigma5mForFv,
+      yesExecutionSideSigma5mForFv,
+    );
+    const fSigma5mForFv =
+      fairValueSigma5mForFv !== null && fairValueSigma5mForFv !== undefined
+        ? fairValueSigma5mForFv - yesTokenPriceSigma5mForFvFeeAdj
+        : null;
+    const { g: gSigma5mForFv, fMinusG: fMinusGSigma5mForFv } = rollingGFromPriorF(
+      pastSigma5mForFvF,
+      fSigma5mForFv,
+    );
+
+    const yesExecutionSideSigma10mForFv = directionalExecutionSide(
+      fairValueSigma10mForFv,
+      row.yesBid,
+      row.yesAsk,
+    );
+    const yesTokenPriceSigma10mForFv = directionalYesExecutionPrice(
+      fairValueSigma10mForFv,
+      row.yesBid,
+      row.yesAsk,
+    );
+    const yesTokenPriceSigma10mForFvFeeAdj = feeAdjustedYesExecutionPrice(
+      yesTokenPriceSigma10mForFv,
+      yesExecutionSideSigma10mForFv,
+    );
+    const fSigma10mForFv =
+      fairValueSigma10mForFv !== null && fairValueSigma10mForFv !== undefined
+        ? fairValueSigma10mForFv - yesTokenPriceSigma10mForFvFeeAdj
+        : null;
+    const { g: gSigma10mForFv, fMinusG: fMinusGSigma10mForFv } = rollingGFromPriorF(
+      pastSigma10mForFvF,
+      fSigma10mForFv,
+    );
+
     const binancePrice =
       row.binanceBtcPrice !== undefined && row.binanceBtcPrice !== null ? row.binanceBtcPrice : null;
 
@@ -423,6 +483,14 @@ function computeRows(
       fSigma10m,
       gSigma10m,
       fMinusGSigma10m,
+      fSigma5mForFv,
+      gSigma5mForFv,
+      fMinusGSigma5mForFv,
+      fSigma10mForFv,
+      gSigma10mForFv,
+      fMinusGSigma10mForFv,
+      tradeSignalSigma5mForFv: 0,
+      tradeSignalSigma10mForFv: 0,
     });
   }
 
@@ -445,14 +513,69 @@ function computeRows(
       row.fMinusGDeribitIv,
       deribitPass,
     );
+    row.tradeSignalSigma5mForFv = computeTradeSignal(
+      row,
+      row.fSigma5mForFv,
+      row.fMinusGSigma5mForFv,
+      sigma5mPass,
+    );
+    row.tradeSignalSigma10mForFv = computeTradeSignal(
+      row,
+      row.fSigma10mForFv,
+      row.fMinusGSigma10mForFv,
+      sigma10mPass,
+    );
   }
 
   return computed;
 }
 
+interface SignalAddCounts {
+  label: string;
+  longAdds: number;
+  shortAdds: number;
+}
+
+function countTradeSignalAdds(
+  rows: ComputedReportRow[],
+  pickSignal: (row: ComputedReportRow) => -1 | 0 | 1,
+): { longAdds: number; shortAdds: number } {
+  let longAdds = 0;
+  let shortAdds = 0;
+  for (const row of rows) {
+    const signal = pickSignal(row);
+    if (signal === 1) longAdds++;
+    else if (signal === -1) shortAdds++;
+  }
+  return { longAdds, shortAdds };
+}
+
+function computeSignalAddCounts(rows: ComputedReportRow[]): SignalAddCounts[] {
+  const tracks: Array<{ label: string; pick: (row: ComputedReportRow) => -1 | 0 | 1 }> = [
+    { label: 'sigma_5m (raw)', pick: (row) => row.tradeSignalSigma5m },
+    { label: 'sigma_10m (raw)', pick: (row) => row.tradeSignalSigma10m },
+    { label: 'sigma_5m_for_fv (adj)', pick: (row) => row.tradeSignalSigma5mForFv },
+    { label: 'sigma_10m_for_fv (adj)', pick: (row) => row.tradeSignalSigma10mForFv },
+    { label: 'deribit_iv', pick: (row) => row.tradeSignalDeribitIv },
+  ];
+  return tracks.map(({ label, pick }) => ({
+    label,
+    ...countTradeSignalAdds(rows, pick),
+  }));
+}
+
+function formatLongShortRatio(longAdds: number, shortAdds: number): string {
+  if (longAdds === 0 && shortAdds === 0) return '—';
+  if (shortAdds === 0) return longAdds > 0 ? '∞ (no shorts)' : '—';
+  return (longAdds / shortAdds).toFixed(2);
+}
+
 function computeSummary(rows: ComputedReportRow[]) {
+  const signalAddCounts = computeSignalAddCounts(rows);
+
   if (rows.length === 0) {
     return {
+      signalAddCounts,
       avgF: null,
       minF: null,
       maxF: null,
@@ -513,6 +636,7 @@ function computeSummary(rows: ComputedReportRow[]) {
     values.length === 0 ? null : values.reduce((sum, value) => sum + value, 0) / values.length;
 
   return {
+    signalAddCounts,
     avgF: average(fValues),
     minF: Math.min(...fValues),
     maxF: Math.max(...fValues),
@@ -551,86 +675,107 @@ function computeSummary(rows: ComputedReportRow[]) {
   };
 }
 
-function toCsv(rows: ComputedReportRow[]): string {
-  const header = [
-    'iso_time',
-    'chainlink_ts',
-    'binance_ts',
-    'binance_redis_ts',
-    'fair_value_redis_ts',
-    'time_to_expiry_ms',
-    'time_to_expiry_sec',
-    'strike_price',
-    'chainlink_price',
-    'binance_btcusdc_price',
-    'annualized_sigma_5m',
-    'annualized_sigma_10m',
-    'fair_value_sigma_5m',
-    'fair_value_sigma_10m',
-    'fair_value_deribit_iv',
-    'yes_bid',
-    'yes_ask',
-    'yes_execution_side',
-    'yes_exec_price_raw',
-    'yes_exec_price_fee_adj',
-    'taker_fee_rate',
-    'no_bid',
-    'no_ask',
-    'f_sigma_5m',
-    'g_sigma_5m',
-    'f_minus_g_sigma_5m',
-    'trade_signal_sigma_5m',
-    'f_sigma_10m',
-    'g_sigma_10m',
-    'f_minus_g_sigma_10m',
-    'trade_signal_sigma_10m',
-    'f_deribit_iv',
-    'g_deribit_iv',
-    'f_minus_g_deribit_iv',
-    'trade_signal_deribit_iv',
+const REPORT_ROW_CSV_HEADERS = [
+  'iso_time',
+  'chainlink_ts',
+  'binance_ts',
+  'binance_redis_ts',
+  'fair_value_redis_ts',
+  'time_to_expiry_ms',
+  'time_to_expiry_sec',
+  'strike_price',
+  'chainlink_price',
+  'binance_btcusdc_price',
+  'annualized_sigma_5m',
+  'annualized_sigma_10m',
+  'fair_value_sigma_5m',
+  'fair_value_sigma_10m',
+  'fair_value_sigma_5m_for_fv',
+  'fair_value_sigma_10m_for_fv',
+  'fair_value_deribit_iv',
+  'yes_bid',
+  'yes_ask',
+  'yes_execution_side',
+  'yes_exec_price_raw',
+  'yes_exec_price_fee_adj',
+  'taker_fee_rate',
+  'no_bid',
+  'no_ask',
+  'f_sigma_5m',
+  'g_sigma_5m',
+  'f_minus_g_sigma_5m',
+  'trade_signal_sigma_5m',
+  'f_sigma_10m',
+  'g_sigma_10m',
+  'f_minus_g_sigma_10m',
+  'trade_signal_sigma_10m',
+  'f_sigma_5m_for_fv',
+  'g_sigma_5m_for_fv',
+  'f_minus_g_sigma_5m_for_fv',
+  'trade_signal_sigma_5m_for_fv',
+  'f_sigma_10m_for_fv',
+  'g_sigma_10m_for_fv',
+  'f_minus_g_sigma_10m_for_fv',
+  'trade_signal_sigma_10m_for_fv',
+  'f_deribit_iv',
+  'g_deribit_iv',
+  'f_minus_g_deribit_iv',
+  'trade_signal_deribit_iv',
+] as const;
+
+function reportRowCellValues(row: ComputedReportRow): string[] {
+  return [
+    row.isoTime,
+    String(row.chainlinkTs),
+    row.binanceTs !== null && row.binanceTs !== undefined ? String(row.binanceTs) : '',
+    row.binanceRedisTs !== null && row.binanceRedisTs !== undefined ? String(row.binanceRedisTs) : '',
+    String(row.publishedAt),
+    String(row.timeToExpiryMs),
+    String(Math.round(row.timeToExpiryMs / 1000)),
+    formatMaybeNumber(row.strikePrice, 2),
+    formatNum(row.chainlinkPrice, 2),
+    row.binancePrice !== null ? formatNum(row.binancePrice, 2) : '',
+    formatMaybeNumber(row.annualizedSigma5m),
+    formatMaybeNumber(row.annualizedSigma10m),
+    formatMaybeNumber(row.fairValueSigma5m),
+    formatMaybeNumber(row.fairValueSigma10m),
+    formatMaybeNumber(row.fairValueSigma5mForFv),
+    formatMaybeNumber(row.fairValueSigma10mForFv),
+    formatMaybeNumber(row.fairValueDeribitIv),
+    formatNum(row.yesBid),
+    formatNum(row.yesAsk),
+    row.yesExecutionSide,
+    formatNum(row.yesTokenPrice),
+    formatNum(row.yesTokenPriceFeeAdj),
+    formatNum(TAKER_FEE_RATE, 6),
+    formatNum(row.noBid),
+    formatNum(row.noAsk),
+    formatMaybeNumber(row.fSigma5m),
+    formatMaybeNumber(row.gSigma5m),
+    formatMaybeNumber(row.fMinusGSigma5m),
+    String(row.tradeSignalSigma5m),
+    formatMaybeNumber(row.fSigma10m),
+    formatMaybeNumber(row.gSigma10m),
+    formatMaybeNumber(row.fMinusGSigma10m),
+    String(row.tradeSignalSigma10m),
+    formatMaybeNumber(row.fSigma5mForFv),
+    formatMaybeNumber(row.gSigma5mForFv),
+    formatMaybeNumber(row.fMinusGSigma5mForFv),
+    String(row.tradeSignalSigma5mForFv),
+    formatMaybeNumber(row.fSigma10mForFv),
+    formatMaybeNumber(row.gSigma10mForFv),
+    formatMaybeNumber(row.fMinusGSigma10mForFv),
+    String(row.tradeSignalSigma10mForFv),
+    formatMaybeNumber(row.fDeribitIv),
+    formatMaybeNumber(row.gDeribitIv),
+    formatMaybeNumber(row.fMinusGDeribitIv),
+    String(row.tradeSignalDeribitIv),
   ];
+}
 
-  const lines = rows.map((row) =>
-    [
-      row.isoTime,
-      String(row.chainlinkTs),
-      row.binanceTs !== null && row.binanceTs !== undefined ? String(row.binanceTs) : '',
-      row.binanceRedisTs !== null && row.binanceRedisTs !== undefined ? String(row.binanceRedisTs) : '',
-      String(row.publishedAt),
-      String(row.timeToExpiryMs),
-      String(Math.round(row.timeToExpiryMs / 1000)),
-      formatMaybeNumber(row.strikePrice, 2),
-      formatNum(row.chainlinkPrice, 2),
-      row.binancePrice !== null ? formatNum(row.binancePrice, 2) : '',
-      formatMaybeNumber(row.annualizedSigma5m),
-      formatMaybeNumber(row.annualizedSigma10m),
-      formatMaybeNumber(row.fairValueSigma5m),
-      formatMaybeNumber(row.fairValueSigma10m),
-      formatMaybeNumber(row.fairValueDeribitIv),
-      formatNum(row.yesBid),
-      formatNum(row.yesAsk),
-      row.yesExecutionSide,
-      formatNum(row.yesTokenPrice),
-      formatNum(row.yesTokenPriceFeeAdj),
-      formatNum(TAKER_FEE_RATE, 6),
-      formatNum(row.noBid),
-      formatNum(row.noAsk),
-      formatMaybeNumber(row.fSigma5m),
-      formatMaybeNumber(row.gSigma5m),
-      formatMaybeNumber(row.fMinusGSigma5m),
-      String(row.tradeSignalSigma5m),
-      formatMaybeNumber(row.fSigma10m),
-      formatMaybeNumber(row.gSigma10m),
-      formatMaybeNumber(row.fMinusGSigma10m),
-      String(row.tradeSignalSigma10m),
-      formatMaybeNumber(row.fDeribitIv),
-      formatMaybeNumber(row.gDeribitIv),
-      formatMaybeNumber(row.fMinusGDeribitIv),
-      String(row.tradeSignalDeribitIv),
-    ].join(','),
-  );
-
-  return [header.join(','), ...lines].join('\n');
+function toCsv(rows: ComputedReportRow[]): string {
+  const lines = rows.map((row) => reportRowCellValues(row).join(','));
+  return [REPORT_ROW_CSV_HEADERS.join(','), ...lines].join('\n');
 }
 
 function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath: string): string {
@@ -682,11 +827,28 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
     '- `f_sigma_5m = fair_value_sigma_5m - yes_exec_price_fee_adj`, `f_sigma_10m = fair_value_sigma_10m - yes_exec_price_fee_adj`, `f_deribit_iv = fair_value_deribit_iv - yes_exec_price_fee_adj`.',
   );
   lines.push(
+    '- `fair_value_sigma_*_for_fv` uses Deribit-blended σ from fairValueUpdater; `f_sigma_*_for_fv` uses the same directional `yes_exec_price_fee_adj` as other sigma tracks.',
+  );
+  lines.push(
     '- For each track, `g` is the mean of previous 10 `f` samples and `f_minus_g = f - g`.',
   );
   lines.push(
     '- `trade_signal_*` values are `1` (buy), `-1` (short), `0` (no trade), using the same conditions as backtest logic.',
   );
+  lines.push('');
+  lines.push('## Trade signal adds (#L / #S)');
+  lines.push('');
+  lines.push(
+    'Row-level counts of `trade_signal_* === 1` (#L) and `=== -1` (#S) in this round (same rules as backtest, before position cap). High **L:S** on sigma tracks suggests long-heavy signaling.',
+  );
+  lines.push('');
+  lines.push('| track | #L adds | #S adds | L:S |');
+  lines.push('| --- | ---: | ---: | ---: |');
+  for (const track of summary.signalAddCounts) {
+    lines.push(
+      `| ${track.label} | ${track.longAdds} | ${track.shortAdds} | ${formatLongShortRatio(track.longAdds, track.shortAdds)} |`,
+    );
+  }
   lines.push('');
   lines.push('## Summary');
   lines.push('');
@@ -734,25 +896,12 @@ function toMarkdown(market: ActiveMarketInfo, rows: ComputedReportRow[], csvPath
   lines.push('');
   lines.push('## Rows');
   lines.push('');
-  lines.push(
-    '| iso time | chainlink ts | binance ts | binance redis ts | fair value redis ts | tte ms | tte sec | strike | chainlink | binance | ann sigma 5m | ann sigma 10m | fv sigma 5m | fv sigma 10m | fv deribit iv | yes bid | yes ask | yes exec side | yes exec raw | yes exec fee adj | no bid | no ask | f sigma 5m | g sigma 5m | f-g sigma 5m | signal sigma 5m | f sigma 10m | g sigma 10m | f-g sigma 10m | signal sigma 10m | f deribit iv | g deribit iv | f-g deribit iv | signal deribit iv |',
-  );
-  lines.push(
-    '| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |',
-  );
-
+  lines.push(`Same columns as CSV (\`${relativeCsvPath}\`).`);
+  lines.push('');
+  lines.push(`| ${REPORT_ROW_CSV_HEADERS.join(' | ')} |`);
+  lines.push(`| ${REPORT_ROW_CSV_HEADERS.map(() => '---').join(' | ')} |`);
   for (const row of rows) {
-    lines.push(
-      `| ${row.isoTime} | ${row.chainlinkTs} | ${row.binanceTs ?? 'N/A'} | ${row.binanceRedisTs ?? 'N/A'} | ${row.publishedAt} | ` +
-        `${row.timeToExpiryMs} | ${Math.round(row.timeToExpiryMs / 1000)} | ${formatMaybeNumber(row.strikePrice, 2)} | ` +
-        `${formatNum(row.chainlinkPrice, 2)} | ${formatMaybeNumber(row.binancePrice, 2) || 'N/A'} | ` +
-        `${formatMaybeNumber(row.annualizedSigma5m)} | ${formatMaybeNumber(row.annualizedSigma10m)} | ` +
-        `${formatMaybeNumber(row.fairValueSigma5m)} | ${formatMaybeNumber(row.fairValueSigma10m)} | ${formatMaybeNumber(row.fairValueDeribitIv)} | ` +
-        `${formatNum(row.yesBid)} | ${formatNum(row.yesAsk)} | ${row.yesExecutionSide} | ${formatNum(row.yesTokenPrice)} | ${formatNum(row.yesTokenPriceFeeAdj)} | ${formatNum(row.noBid)} | ${formatNum(row.noAsk)} | ` +
-        `${formatMaybeNumber(row.fSigma5m)} | ${formatMaybeNumber(row.gSigma5m)} | ${formatMaybeNumber(row.fMinusGSigma5m)} | ${row.tradeSignalSigma5m} | ` +
-        `${formatMaybeNumber(row.fSigma10m)} | ${formatMaybeNumber(row.gSigma10m)} | ${formatMaybeNumber(row.fMinusGSigma10m)} | ${row.tradeSignalSigma10m} | ` +
-        `${formatMaybeNumber(row.fDeribitIv)} | ${formatMaybeNumber(row.gDeribitIv)} | ${formatMaybeNumber(row.fMinusGDeribitIv)} | ${row.tradeSignalDeribitIv} |`,
-    );
+    lines.push(`| ${reportRowCellValues(row).join(' | ')} |`);
   }
 
   return lines.join('\n');
@@ -787,8 +936,16 @@ export async function generateMarketRoundReport(
       ? market.deribitMarkIvAnnual
       : null;
   const rows = computeRows(await getMarketReportRows(market.conditionId), deribitMarkIvAnnual);
+  const signalAddCounts = computeSignalAddCounts(rows);
   const markdown = toMarkdown(market, rows, csvPath);
   const csv = toCsv(rows);
+
+  console.log(`[marketRoundReport] ${market.slug} trade signal adds:`);
+  for (const track of signalAddCounts) {
+    console.log(
+      `  ${track.label}: #L=${track.longAdds} #S=${track.shortAdds} L:S=${formatLongShortRatio(track.longAdds, track.shortAdds)}`,
+    );
+  }
 
   await Promise.all([
     writeFile(markdownPath, `${markdown}\n`, 'utf8'),

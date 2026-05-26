@@ -66,6 +66,15 @@ export interface BaseFairValueInput {
   perSecondVolatility: number;
 }
 
+export function adjustedPerSecondVolatilityFromCoarseAndDeribit(
+  coarsePerSecond: number,
+  deribitAnnual: number,
+): number {
+  const coarseAnnual = annualizedVolatilityFromPerSecond(coarsePerSecond);
+  const adjustedAnnual = Math.max((coarseAnnual + deribitAnnual) * 0.5, deribitAnnual * 0.75);
+  return perSecondVolatilityFromAnnual(adjustedAnnual);
+}
+
 /**
  * Binary-option p_base fair value under Black-Scholes with r = 0.
  */
